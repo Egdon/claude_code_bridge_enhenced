@@ -1,9 +1,9 @@
 <div align="center">
 
-# Claude Code Bridge (ccb) v5.2.6
+# Claude Code Bridge Enhanced (ccb) v5.3.0
 
-**终端分屏多模型协作工具**
-**Claude · Codex · Gemini · OpenCode · Droid**
+**终端分屏多模型、多实例协作工具**
+**Claude · Codex · Gemini · OpenCode · Droid · Cursor**
 **轻量异步通讯，交互皆可见，模型皆可控**
 
 <p>
@@ -11,8 +11,9 @@
   <img src="https://img.shields.io/badge/模型皆可控-CF1322?style=for-the-badge" alt="模型皆可控">
 </p>
 
-[![Version](https://img.shields.io/badge/version-5.2.6-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-5.3.0-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+[![Based on](https://img.shields.io/badge/基于-bfly123%2Fccb-blue.svg)](https://github.com/bfly123/claude_code_bridge)
 
 [English](README.md) | **中文**
 
@@ -35,6 +36,78 @@
 
 **简介：** 多模型协作能有效避免模型偏见、认知盲区和上下文限制。不同于 MCP 或 API 调用方式，ccb 提供终端分屏所见即所得体验——交互皆可见，模型皆可控。
 
+> **说明：** 本项目是 [bfly123/claude_code_bridge](https://github.com/bfly123/claude_code_bridge) 的增强分支。原项目提供了基础框架，本分支在此基础上新增了多实例 Target 支持、实时控制平面和 Cursor CLI 集成。
+
+---
+
+## 🔥 增强内容（相比上游）
+
+本分支在原版 CCB 基础上引入了以下主要增强：
+
+### 1. 多实例 Target 模型（`provider@instance`）
+
+原版 CCB 采用扁平的 provider 模型——每个 provider 只能有一个实例。本分支升级为 `provider@instance` 的 target 模型，支持同一 provider 同时运行多个实例。
+
+- **Target 语法**：`codex@1`、`codex@2`、`claude@main` —— 同一 provider，不同实例
+- **运行时增删**：`ccb add codex@3` / `ccb rm codex@2` —— 无需重启即可动态管理
+- **进程状态查看**：`ccb ps` —— 查看所有运行中的 target 及其状态
+- **独立会话隔离**：每个 target 拥有独立的会话文件，位于 `.ccb/sessions/<provider>/<instance>.json`
+- **向后兼容**：旧格式 `codex,gemini,claude` 会自动归一化为 `codex@main,gemini@main,claude@main`
+
+```bash
+# 启动两个 Codex 实例 + Claude anchor
+ccb codex@1 codex@2 claude@main
+
+# 运行时添加第三个 Codex
+ccb add codex@3
+
+# 移除一个
+ccb rm codex@2
+```
+
+### 2. 实时控制平面（TCP Socket）
+
+CCB 运行时会启动一个 localhost TCP 服务，使外部命令能与运行中的 CCB 进程实时通信。
+
+- **Live Socket**：`ccb add` / `ccb rm` 通过 TCP 发送请求到运行中的进程——无需重启
+- **Token 鉴权**：每个会话生成唯一 token，确保通信安全
+- **优雅降级**：socket 不可达时，自动回退到文件系统状态
+- **探活与关闭**：`control.ping` / `control.shutdown` 用于健康检查和优雅退出
+
+### 3. Cursor CLI 集成（第 6 个 Provider）
+
+完整支持 [Cursor](https://cursor.sh/) 作为第 6 个 provider，与 Claude、Codex、Gemini、OpenCode、Droid 并列。
+
+- **`uask <message>`** —— 向 Cursor CLI 发送请求
+- **`upend [N]`** —— 查看 Cursor 最新回复
+- **`uping`** —— 测试 Cursor pane 连通性
+- **JSONL 日志读取器** —— 流式读取 Cursor 的 `agent-transcripts/*.jsonl` 文件，支持偏移量追踪
+- **CCB 协议包装** —— 完整支持 `CCB_REQ_ID` / `CCB_BEGIN` / `CCB_DONE` 协议
+- **Daemon 适配器** —— `CursorAdapter` 集成到统一的 `askd` 守护进程架构
+
+### 4. Target 感知的命令升级
+
+所有统一命令从 provider 级别升级为 target 级别粒度：
+
+| 命令 | Target 范围 | Provider 范围 | 全部范围 |
+| :--- | :--- | :--- | :--- |
+| `ccb-ping` | `ccb-ping codex@2` | `ccb-ping --provider codex` | `ccb-ping` |
+| `ccb kill` | `ccb kill codex@2` | `ccb kill --provider codex` | `ccb kill` |
+| `autonew` | `autonew codex@1` | `autonew codex` | `autonew` |
+| `ask` | `ask codex@2 "..."` | `ask codex "..."` | — |
+| `ccb-mounted` | — | — | 按 target 报告挂载状态 |
+
+### 5. 内部架构改进
+
+- **`target_command_utils.py`**：统一的 target 操作工具层，包含 target 解析、ping、文本发送、kill、会话状态管理
+- **`session_store.py`**：按 target 的持久化会话存储（`write_target_session` / `load_target_session` / `list_target_sessions`）
+- **`pane_registry.py`**：扩展了 `instances` 层级，与旧 `providers` 层级共存并双向同步
+- **Completion Hook**：现在携带 `CCB_TARGET`、`CCB_INSTANCE`、`CCB_CALLER_TARGET` 环境变量
+- **Context Transfer**：去重键包含归一化 target，防止跨实例干扰
+- **Daemon 层**：`ProviderRequest` 携带 `target` / `instance` / `caller_target` 字段；新增忙等宽限期检测
+
+---
+
 ## ⚡ 核心优势
 
 | 特性 | 价值 |
@@ -51,6 +124,31 @@
 <h2 align="center">🚀 新版本速览</h2>
 
 <details open>
+<summary><b>v5.3.0</b> - 多实例 Target、实时控制平面 & Cursor 集成</summary>
+
+**🎯 多实例 Target 模型：**
+- **`provider@instance` 语法**：同一 provider 可运行多个实例（如 `codex@1`、`codex@2`）
+- **运行时管理**：`ccb add` / `ccb rm` / `ccb ps` 动态管理 target 生命周期
+- **独立会话隔离**：每个 target 拥有独立会话文件 `.ccb/sessions/<provider>/<instance>.json`
+- **向后兼容**：旧配置自动归一化为 `@main` 实例
+
+**🔌 实时控制平面：**
+- **TCP Socket 服务**：CLI 命令与运行中的 CCB 进程实时通信
+- **Token 鉴权**：每个会话独立的安全认证
+- **优雅降级**：socket 不可达时回退到文件系统状态
+
+**🖱️ Cursor CLI 集成：**
+- **第 6 个 Provider**：完整的 `uask` / `upend` / `uping` 命令集
+- **JSONL 日志读取器**：基于偏移量的流式 Cursor 日志解析
+- **Daemon 适配器**：`CursorAdapter` 集成到统一 `askd` 架构
+
+**🔧 Target 感知命令：**
+- 所有统一命令（`ask`、`ccb-ping`、`ccb kill`、`autonew`、`ccb-mounted`）升级为 target 级别粒度
+- 三种操作范围：target（`codex@2`）、provider（`--provider codex`）、全部
+
+</details>
+
+<details>
 <summary><b>v5.2.6</b> - 异步通信修复 & Gemini 0.29 兼容</summary>
 
 **🔧 Gemini CLI 0.29.0 适配：**
@@ -300,8 +398,8 @@
 <summary><b>Linux</b></summary>
 
 ```bash
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -311,8 +409,8 @@ cd claude_code_bridge
 <summary><b>macOS</b></summary>
 
 ```bash
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -329,8 +427,8 @@ cd claude_code_bridge
 
 ```bash
 # 在 WSL 终端中运行（使用普通用户，不要用 root）
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -342,8 +440,8 @@ cd claude_code_bridge
 > 如果你的 Claude/Codex/Gemini 运行在 Windows 原生环境，请使用此方式。
 
 ```powershell
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 powershell -ExecutionPolicy Bypass -File .\install.ps1 install
 ```
 
@@ -468,8 +566,8 @@ return {
 在 WezTerm 打开的 WSL shell 里执行：
 
 ```bash
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -492,8 +590,8 @@ cping
 在 PowerShell 里执行：
 
 ```powershell
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 powershell -ExecutionPolicy Bypass -File .\install.ps1 install
 ```
 

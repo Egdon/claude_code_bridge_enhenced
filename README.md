@@ -1,9 +1,9 @@
 <div align="center">
 
-# Claude Code Bridge (ccb) v5.2.6
+# Claude Code Bridge Enhanced (ccb) v5.3.0
 
-**Multi-Model Collaboration via Split-Pane Terminal**
-**Claude · Codex · Gemini · OpenCode · Droid**
+**Multi-Model, Multi-Instance Collaboration via Split-Pane Terminal**
+**Claude · Codex · Gemini · OpenCode · Droid · Cursor**
 **Lightweight async messaging — full CLI power, every interaction visible**
 
 <p>
@@ -11,11 +11,11 @@
   <img src="https://img.shields.io/badge/Every_Model_Controllable-CF1322?style=for-the-badge" alt="Every Model Controllable">
 </p>
 
-[![Version](https://img.shields.io/badge/version-5.2.6-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-5.3.0-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![CI](https://github.com/bfly123/claude_code_bridge/actions/workflows/test.yml/badge.svg)](https://github.com/bfly123/claude_code_bridge/actions/workflows/test.yml)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+[![Based on](https://img.shields.io/badge/based_on-bfly123%2Fccb-blue.svg)](https://github.com/bfly123/claude_code_bridge)
 
 **English** | [Chinese](README_zh.md)
 
@@ -36,6 +36,78 @@
 
 **Introduction:** Multi-model collaboration avoids model bias, cognitive blind spots, and context limits. Unlike MCP or API-based approaches, ccb gives you a WYSIWYG split-pane terminal where every interaction is visible and every model is controllable.
 
+> **Note:** This is an enhanced fork of [bfly123/claude_code_bridge](https://github.com/bfly123/claude_code_bridge). The original project provides the foundation; this fork adds multi-instance target support, a live control plane, and Cursor CLI integration.
+
+---
+
+## 🔥 What's Enhanced (vs upstream)
+
+This fork introduces three major enhancements on top of the original CCB:
+
+### 1. Multi-Instance Target Model (`provider@instance`)
+
+The original CCB uses a flat provider model — one instance per provider. This fork upgrades to a `provider@instance` target model, allowing multiple instances of the same provider to run simultaneously.
+
+- **Target syntax**: `codex@1`, `codex@2`, `claude@main` — same provider, different instances
+- **Runtime add/remove**: `ccb add codex@3` / `ccb rm codex@2` — dynamically manage targets without restarting
+- **Process status**: `ccb ps` — view all running targets and their status
+- **Per-target session isolation**: Each target gets its own session file at `.ccb/sessions/<provider>/<instance>.json`
+- **Backward compatible**: Legacy `codex,gemini,claude` config auto-normalizes to `codex@main,gemini@main,claude@main`
+
+```bash
+# Run two Codex instances + Claude anchor
+ccb codex@1 codex@2 claude@main
+
+# Add a third Codex at runtime
+ccb add codex@3
+
+# Remove one
+ccb rm codex@2
+```
+
+### 2. Live Control Plane (TCP Socket)
+
+A localhost TCP server runs alongside CCB, enabling real-time communication between external commands and the running CCB process.
+
+- **Live socket**: `ccb add` / `ccb rm` send requests via TCP to the running process — no restart needed
+- **Token auth**: Each session gets a unique token for secure communication
+- **Graceful fallback**: If the socket is unreachable, commands fall back to file-based state
+- **Ping & shutdown**: `control.ping` / `control.shutdown` for health checks and clean teardown
+
+### 3. Cursor CLI Integration (6th Provider)
+
+Full support for [Cursor](https://cursor.sh/) as the 6th provider, alongside Claude, Codex, Gemini, OpenCode, and Droid.
+
+- **`uask <message>`** — Send requests to Cursor CLI
+- **`upend [N]`** — Read latest Cursor replies
+- **`uping`** — Test Cursor pane connectivity
+- **JSONL transcript reader**: Reads Cursor's `agent-transcripts/*.jsonl` files with streaming offset support
+- **CCB protocol wrapping**: Full `CCB_REQ_ID` / `CCB_BEGIN` / `CCB_DONE` protocol support
+- **Daemon adapter**: `CursorAdapter` integrates into the unified `askd` daemon architecture
+
+### 4. Target-Aware Command Upgrades
+
+All unified commands are upgraded from provider-level to target-level granularity:
+
+| Command | Target scope | Provider scope | All scope |
+| :--- | :--- | :--- | :--- |
+| `ccb-ping` | `ccb-ping codex@2` | `ccb-ping --provider codex` | `ccb-ping` |
+| `ccb kill` | `ccb kill codex@2` | `ccb kill --provider codex` | `ccb kill` |
+| `autonew` | `autonew codex@1` | `autonew codex` | `autonew` |
+| `ask` | `ask codex@2 "..."` | `ask codex "..."` | — |
+| `ccb-mounted` | — | — | Reports per-target mount status |
+
+### 5. Internal Architecture Improvements
+
+- **`target_command_utils.py`**: Unified utility layer for target resolution, ping, send-text, kill, and session state management
+- **`session_store.py`**: Per-target persistent session storage (`write_target_session` / `load_target_session` / `list_target_sessions`)
+- **`pane_registry.py`**: Extended with `instances` layer alongside legacy `providers`, with bi-directional sync
+- **Completion hook**: Now carries `CCB_TARGET`, `CCB_INSTANCE`, `CCB_CALLER_TARGET` environment variables
+- **Context transfer**: De-duplication keys include normalized target, preventing cross-instance interference
+- **Daemon layer**: `ProviderRequest` carries `target` / `instance` / `caller_target` fields; busy grace period detection added
+
+---
+
 ## ⚡ Why ccb?
 
 | Feature | Benefit |
@@ -50,6 +122,31 @@
 <h2 align="center">🚀 What's New</h2>
 
 <details open>
+<summary><b>v5.3.0</b> - Multi-Instance Targets, Live Control Plane & Cursor Integration</summary>
+
+**🎯 Multi-Instance Target Model:**
+- **`provider@instance` syntax**: Run multiple instances of the same provider (e.g., `codex@1`, `codex@2`)
+- **Runtime management**: `ccb add` / `ccb rm` / `ccb ps` for dynamic target lifecycle
+- **Per-target session isolation**: Independent session files at `.ccb/sessions/<provider>/<instance>.json`
+- **Backward compatible**: Legacy configs auto-normalize to `@main` instances
+
+**🔌 Live Control Plane:**
+- **TCP socket server**: Real-time communication between CLI commands and running CCB process
+- **Token authentication**: Secure per-session auth for control operations
+- **Graceful fallback**: File-based state when socket is unreachable
+
+**🖱️ Cursor CLI Integration:**
+- **6th provider**: Full `uask` / `upend` / `uping` command set for Cursor
+- **JSONL transcript reader**: Streaming offset-based Cursor log parsing
+- **Daemon adapter**: `CursorAdapter` integrated into unified `askd` architecture
+
+**🔧 Target-Aware Commands:**
+- All unified commands (`ask`, `ccb-ping`, `ccb kill`, `autonew`, `ccb-mounted`) upgraded to target-level granularity
+- Three scope levels: target (`codex@2`), provider (`--provider codex`), all
+
+</details>
+
+<details>
 <summary><b>v5.2.6</b> - Async Communication & Gemini 0.29 Compatibility</summary>
 
 **🔧 Gemini CLI 0.29.0 Support:**
@@ -341,8 +438,8 @@ Highlights:
 <summary><b>Linux</b></summary>
 
 ```bash
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -352,8 +449,8 @@ cd claude_code_bridge
 <summary><b>macOS</b></summary>
 
 ```bash
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -370,8 +467,8 @@ cd claude_code_bridge
 
 ```bash
 # Run inside WSL terminal (as normal user, NOT root)
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 ./install.sh install
 ```
 
@@ -383,8 +480,8 @@ cd claude_code_bridge
 > Use this if your Claude/Codex/Gemini runs natively on Windows.
 
 ```powershell
-git clone https://github.com/bfly123/claude_code_bridge.git
-cd claude_code_bridge
+git clone https://github.com/Egdon/claude_code_bridge_enhenced.git
+cd claude_code_bridge_enhenced
 powershell -ExecutionPolicy Bypass -File .\install.ps1 install
 ```
 

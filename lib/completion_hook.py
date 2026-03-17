@@ -14,6 +14,18 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from target_id import instance_of, provider_of, validate_target
+
+
+def _normalize_target_env(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    try:
+        return validate_target(raw)
+    except ValueError:
+        return raw
+
 
 def env_bool(name: str, default: bool = True) -> bool:
     val = os.environ.get(name, "").strip().lower()
@@ -28,6 +40,8 @@ def _run_hook_async(
     reply: str,
     req_id: str,
     caller: str,
+    target: str | None = None,
+    caller_target: str | None = None,
     email_req_id: str = "",
     email_msg_id: str = "",
     email_from: str = "",
@@ -77,6 +91,18 @@ def _run_hook_async(
             env = os.environ.copy()
             env["CCB_CALLER"] = caller  # Ensure caller is passed via env var
             env["CCB_DONE_SEEN"] = "1" if done_seen else "0"  # Pass completion status
+            env["CCB_PROVIDER"] = provider
+            canonical_target = _normalize_target_env(target)
+            if canonical_target:
+                env["CCB_TARGET"] = canonical_target
+                try:
+                    env["CCB_PROVIDER"] = provider_of(canonical_target)
+                    env["CCB_INSTANCE"] = instance_of(canonical_target)
+                except ValueError:
+                    pass
+            canonical_caller_target = _normalize_target_env(caller_target)
+            if canonical_caller_target:
+                env["CCB_CALLER_TARGET"] = canonical_caller_target
             if email_req_id:
                 env["CCB_EMAIL_REQ_ID"] = email_req_id
             if email_msg_id:
@@ -112,6 +138,8 @@ def notify_completion(
     req_id: str,
     done_seen: bool,
     caller: str = "claude",
+    target: str | None = None,
+    caller_target: str | None = None,
     email_req_id: str = "",
     email_msg_id: str = "",
     email_from: str = "",
@@ -135,4 +163,17 @@ def notify_completion(
     # Always notify completion, even if done_seen=False
     # Let the hook receiver decide how to handle incomplete/timeout cases
     # This prevents "processing forever" when CCB_DONE marker is missing/mismatched
-    _run_hook_async(provider, output_file, reply, req_id, caller, email_req_id, email_msg_id, email_from, work_dir, done_seen)
+    _run_hook_async(
+        provider,
+        output_file,
+        reply,
+        req_id,
+        caller,
+        target,
+        caller_target,
+        email_req_id,
+        email_msg_id,
+        email_from,
+        work_dir,
+        done_seen,
+    )

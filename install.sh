@@ -115,6 +115,9 @@ SCRIPTS_TO_LINK=(
   bin/dask
   bin/dpend
   bin/dping
+  bin/uask
+  bin/upend
+  bin/uping
   bin/ask
   bin/ccb-ping
   bin/pend

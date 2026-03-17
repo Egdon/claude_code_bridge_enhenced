@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from env_utils import env_bool, env_int
+from target_id import to_fs_safe_slug, validate_target
 
 _AUTO_TRANSFER_LOCK = threading.Lock()
 _AUTO_TRANSFER_SEEN: dict[str, float] = {}
@@ -40,17 +41,25 @@ def _is_current_work_dir(work_dir: Path) -> bool:
 
 def _auto_transfer_key(
     provider: str,
+    target: Optional[str],
     work_dir: Path,
     session_path: Optional[Path],
     session_id: Optional[str],
     project_id: Optional[str],
 ) -> str:
-    return f"{provider}::{work_dir}::{session_path or ''}::{session_id or ''}::{project_id or ''}"
+    normalized_target = ""
+    if target:
+        try:
+            normalized_target = validate_target(target)
+        except ValueError:
+            normalized_target = str(target).strip().lower()
+    return f"{provider}::{normalized_target}::{_normalize_path_for_match(work_dir)}::{session_path or ''}::{session_id or ''}::{project_id or ''}"
 
 
 def maybe_auto_transfer(
     *,
     provider: str,
+    target: str | None = None,
     work_dir: Path,
     session_path: Optional[Path] = None,
     session_id: Optional[str] = None,
@@ -68,7 +77,7 @@ def maybe_auto_transfer(
     if not _is_current_work_dir(work_dir):
         return
 
-    key = _auto_transfer_key(provider, work_dir, session_path, session_id, project_id)
+    key = _auto_transfer_key(provider, target, work_dir, session_path, session_id, project_id)
     now = time.time()
     with _AUTO_TRANSFER_LOCK:
         if key in _AUTO_TRANSFER_SEEN:
@@ -100,6 +109,7 @@ def maybe_auto_transfer(
                 session_path=session_path,
                 last_n=last_n,
                 source_provider=provider,
+                source_target=target,
                 source_session_id=session_id,
                 source_project_id=project_id,
             )
@@ -107,7 +117,13 @@ def maybe_auto_transfer(
                 return
             ts = time.strftime("%Y%m%d-%H%M%S")
             sid = (session_id or (session_path.stem if session_path else "")) or "unknown"
-            filename = f"{provider}-{ts}-{sid}"
+            target_slug = ""
+            if target:
+                try:
+                    target_slug = to_fs_safe_slug(target)
+                except ValueError:
+                    target_slug = str(target).strip().replace("@", "--")
+            filename = f"{provider}-{target_slug + '-' if target_slug else ''}{ts}-{sid}"
             transfer.save_transfer(context, fmt, target_provider, filename=filename)
         except Exception:
             return

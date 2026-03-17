@@ -83,15 +83,16 @@ def _get_executor_from_roles() -> Optional[str]:
 
 
 def _usage() -> None:
-    print("Usage: cask [--sync] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
+    print("Usage: cask [--sync] [--target TARGET] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
 
 
-def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Optional[str], bool]:
+def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Optional[str], bool, Optional[str]]:
     output: Optional[Path] = None
     timeout: Optional[float] = None
     quiet = False
     sync_mode = False
     session_file: Optional[str] = None
+    target: Optional[str] = None
     parts: list[str] = []
 
     it = iter(argv[1:])
@@ -104,6 +105,12 @@ def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Opti
             continue
         if token == "--sync":
             sync_mode = True
+            continue
+        if token == "--target":
+            try:
+                target = next(it)
+            except StopIteration:
+                raise ValueError("--target requires a target id")
             continue
         if token == "--session-file":
             try:
@@ -133,12 +140,12 @@ def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Opti
             timeout = float(os.environ.get("CCB_SYNC_TIMEOUT", "-1"))
         except Exception:
             timeout = -1.0
-    return output, timeout, message, quiet, session_file, sync_mode
+    return output, timeout, message, quiet, session_file, sync_mode, target
 
 
 def main(argv: list[str]) -> int:
     try:
-        output_path, timeout, message, quiet, session_file, sync_mode = _parse_args(argv)
+        output_path, timeout, message, quiet, session_file, sync_mode, target = _parse_args(argv)
         if not message and not sys.stdin.isatty():
             message = read_stdin_text().strip()
         if not message:
@@ -155,28 +162,56 @@ def main(argv: list[str]) -> int:
         work_dir, _ = resolve_work_dir_with_registry(
             CASK_CLIENT_SPEC,
             provider="codex",
+            target=target,
             cli_session_file=session_file,
             env_session_file=os.environ.get("CCB_SESSION_FILE"),
         )
 
         # Daemon-only: remove client-side serial lock mode.
         state_file = state_file_from_env(CASK_CLIENT_SPEC.state_file_env)
-        daemon_result = try_daemon_request(CASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
-        if daemon_result is None and maybe_start_daemon(CASK_CLIENT_SPEC, work_dir):
+        daemon_result = try_daemon_request(
+            CASK_CLIENT_SPEC,
+            work_dir,
+            message,
+            timeout,
+            quiet,
+            state_file,
+            output_path=output_path,
+            target=target,
+        )
+        if daemon_result is None and maybe_start_daemon(CASK_CLIENT_SPEC, work_dir, target=target):
             wait_for_daemon_ready(CASK_CLIENT_SPEC, timeout_s=min(2.0, max(0.2, float(timeout))), state_file=state_file)
-            daemon_result = try_daemon_request(CASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
+            daemon_result = try_daemon_request(
+                CASK_CLIENT_SPEC,
+                work_dir,
+                message,
+                timeout,
+                quiet,
+                state_file,
+                output_path=output_path,
+                target=target,
+            )
         if daemon_result is not None:
             reply, exit_code = daemon_result
-            # Inject guardrail prompt for Claude (skip in sync mode for Codex)
+            if exit_code >= 2 and not reply.strip():
+                print(f"[WARN] Daemon returned exit_code={exit_code} with empty reply, trying tmux fallback", file=sys.stderr)
+            else:
+                if not sync_mode:
+                    print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
+                if output_path:
+                    atomic_write_text(output_path, reply + "\n")
+                    return exit_code
+                sys.stdout.write(reply)
+                if not reply.endswith("\n"):
+                    sys.stdout.write("\n")
+                return exit_code
+
+        # Fallback: send directly to Codex pane
+        from askd_client import try_pane_fallback
+        if try_pane_fallback(CASK_CLIENT_SPEC, work_dir, message, target=target):
             if not sync_mode:
                 print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
-            if output_path:
-                atomic_write_text(output_path, reply + "\n")
-                return exit_code
-            sys.stdout.write(reply)
-            if not reply.endswith("\n"):
-                sys.stdout.write("\n")
-            return exit_code
+            return 0
 
         if not env_bool(CASK_CLIENT_SPEC.enabled_env, True):
             print(f"[ERROR] {CASK_CLIENT_SPEC.enabled_env}=0: cask daemon mode disabled.", file=sys.stderr)

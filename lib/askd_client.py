@@ -18,8 +18,10 @@ from session_utils import (
     find_project_session_file,
     resolve_project_config_dir,
 )
+from pane_registry import load_registry_by_project_id, load_registry_by_target
 from project_id import compute_ccb_project_id
-from pane_registry import load_registry_by_project_id
+from session_store import load_target_session, session_path_for_target
+from target_id import instance_of, provider_of, validate_target
 
 
 def resolve_work_dir(
@@ -73,25 +75,32 @@ def resolve_work_dir(
     return session_path.parent, session_path
 
 
+def _resolve_target_session_file(spec: ProviderClientSpec, work_dir: Path, target: str) -> Path | None:
+    canonical_target = validate_target(target)
+    if load_target_session(work_dir, canonical_target) is not None:
+        return session_path_for_target(work_dir, canonical_target)
+    if instance_of(canonical_target) == "main":
+        return find_project_session_file(work_dir, spec.session_filename)
+    return None
+
+
+def _has_session_for_target(spec: ProviderClientSpec, work_dir: Path, target: str | None) -> bool:
+    if target:
+        return _resolve_target_session_file(spec, work_dir, target) is not None
+    return find_project_session_file(work_dir, spec.session_filename) is not None
+
+
 def resolve_work_dir_with_registry(
     spec: ProviderClientSpec,
     *,
     provider: str,
+    target: str | None = None,
     cli_session_file: str | None = None,
     env_session_file: str | None = None,
     default_cwd: Path | None = None,
     registry_only_env: str = "CCB_REGISTRY_ONLY",
 ) -> tuple[Path, Path | None]:
-    """
-    Resolve work_dir, additionally supporting registry routing by ccb_project_id.
-
-    Priority:
-      1) cli_session_file (--session-file)
-      2) env_session_file (CCB_SESSION_FILE)
-      3) daemon state work_dir (if unified askd is enabled)
-      4) registry lookup by ccb_project_id + provider
-      5) default_cwd / Path.cwd()
-    """
+    """Resolve work_dir, supporting provider-level and target-level routing."""
     raw = (cli_session_file or "").strip() or (env_session_file or "").strip()
     if raw:
         return resolve_work_dir(
@@ -101,14 +110,20 @@ def resolve_work_dir_with_registry(
             default_cwd=default_cwd,
         )
 
-    # Try to get work_dir from unified askd daemon state
+    canonical_target = None
+    if target:
+        canonical_target = validate_target(target)
+        if provider_of(canonical_target) != str(provider or "").strip().lower():
+            raise ValueError(f"target/provider mismatch: {target!r} vs {provider!r}")
+
     from askd_runtime import get_daemon_work_dir
-    daemon_work_dir = get_daemon_work_dir("askd.json")
+
+    daemon_work_dir = get_daemon_work_dir(spec.daemon_state_file_name)
     if daemon_work_dir and daemon_work_dir.exists():
         try:
-            found = find_project_session_file(daemon_work_dir, spec.session_filename)
-            if found:
-                return daemon_work_dir, found
+            session_file = _resolve_target_session_file(spec, daemon_work_dir, canonical_target) if canonical_target else find_project_session_file(daemon_work_dir, spec.session_filename)
+            if session_file:
+                return daemon_work_dir, session_file
         except Exception:
             pass
 
@@ -117,7 +132,18 @@ def resolve_work_dir_with_registry(
         project_id = compute_ccb_project_id(cwd)
     except Exception:
         project_id = ""
-    if project_id:
+
+    if project_id and canonical_target:
+        rec = load_registry_by_target(project_id, canonical_target)
+        if isinstance(rec, dict):
+            wd = rec.get("work_dir")
+            if isinstance(wd, str) and wd.strip():
+                wd_path = Path(wd.strip())
+                session_file = _resolve_target_session_file(spec, wd_path, canonical_target)
+                if session_file:
+                    return wd_path, session_file
+
+    if project_id and not canonical_target:
         rec = load_registry_by_project_id(project_id, provider)
         if isinstance(rec, dict):
             providers = rec.get("providers") if isinstance(rec.get("providers"), dict) else {}
@@ -153,8 +179,16 @@ def resolve_work_dir_with_registry(
                 except Exception:
                     pass
 
+    try:
+        session_file = _resolve_target_session_file(spec, cwd, canonical_target) if canonical_target else find_project_session_file(cwd, spec.session_filename)
+    except Exception:
+        session_file = None
+    if session_file:
+        return cwd, session_file
+
     if env_bool(registry_only_env, False):
-        raise ValueError(f"{registry_only_env}=1: registry routing failed for provider={provider!r} cwd={cwd}")
+        scope = canonical_target or provider
+        raise ValueError(f"{registry_only_env}=1: registry routing failed for target={scope!r} cwd={cwd}")
 
     return (cwd, None)
 
@@ -185,27 +219,32 @@ def try_daemon_request(
     quiet: bool,
     state_file: Optional[Path] = None,
     output_path: Path | None = None,
+    target: str | None = None,
+    caller_target: str | None = None,
 ) -> Optional[Tuple[str, int]]:
     if not env_bool(spec.enabled_env, True):
         return None
 
-    if not find_project_session_file(work_dir, spec.session_filename):
+    canonical_target = None
+    if target:
+        canonical_target = validate_target(target)
+        if provider_of(canonical_target) != spec.provider:
+            raise ValueError(f"target/provider mismatch: {target!r} vs {spec.provider!r}")
+
+    if not _has_session_for_target(spec, work_dir, canonical_target):
         return None
 
     from importlib import import_module
+
     daemon_module = import_module(spec.daemon_module)
     read_state = getattr(daemon_module, "read_state")
 
     st = read_state(state_file=state_file)
 
-    # If state not found and CCB_RUN_DIR is set, try project-specific state file
-    # This fixes background mode where env vars may not be inherited
     if not st:
         run_dir = os.environ.get("CCB_RUN_DIR", "").strip()
         if run_dir:
-            # State file name is derived from protocol_prefix (e.g., cask -> caskd.json)
-            state_filename = f"{spec.protocol_prefix}d.json"
-            project_state = Path(run_dir) / state_filename
+            project_state = Path(run_dir) / spec.daemon_state_file_name
             if project_state.exists():
                 st = read_state(state_file=project_state)
 
@@ -220,15 +259,19 @@ def try_daemon_request(
 
     try:
         payload = {
-            "type": f"{spec.protocol_prefix}.request",
+            "type": f"{spec.daemon_protocol_prefix}.request",
             "v": 1,
             "id": f"{spec.protocol_prefix}-{os.getpid()}-{int(time.time() * 1000)}",
             "token": token,
+            "provider": spec.provider,
             "work_dir": str(work_dir),
             "timeout_s": float(timeout),
             "quiet": bool(quiet),
             "message": message,
         }
+        if canonical_target:
+            payload["target"] = canonical_target
+            payload["instance"] = instance_of(canonical_target)
         if output_path:
             payload["output_path"] = str(output_path)
         req_id = os.environ.get("CCB_REQ_ID", "").strip()
@@ -240,6 +283,9 @@ def try_daemon_request(
         caller = os.environ.get("CCB_CALLER", "").strip()
         if caller:
             payload["caller"] = caller
+        env_caller_target = caller_target or os.environ.get("CCB_CALLER_TARGET", "").strip()
+        if env_caller_target:
+            payload["caller_target"] = env_caller_target
         connect_timeout = min(1.0, max(0.1, float(timeout)))
         with socket.create_connection((host, port), timeout=connect_timeout) as sock:
             sock.settimeout(0.5)
@@ -258,7 +304,7 @@ def try_daemon_request(
                 return None
             line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
             resp = json.loads(line)
-            if resp.get("type") != f"{spec.protocol_prefix}.response":
+            if resp.get("type") != f"{spec.daemon_protocol_prefix}.response":
                 return None
             reply = str(resp.get("reply") or "")
             exit_code = int(resp.get("exit_code", 1))
@@ -267,12 +313,12 @@ def try_daemon_request(
         return None
 
 
-def maybe_start_daemon(spec: ProviderClientSpec, work_dir: Path) -> bool:
+def maybe_start_daemon(spec: ProviderClientSpec, work_dir: Path, target: str | None = None) -> bool:
     if not env_bool(spec.enabled_env, True):
         return False
     if not autostart_enabled(spec.autostart_env_primary, spec.autostart_env_legacy, True):
         return False
-    if not find_project_session_file(work_dir, spec.session_filename):
+    if not _has_session_for_target(spec, work_dir, target):
         return False
 
     candidates: list[str] = []
@@ -321,6 +367,74 @@ def wait_for_daemon_ready(spec: ProviderClientSpec, timeout_s: float = 2.0, stat
             pass
         time.sleep(0.1)
     return False
+
+
+_WRAP_FUNCS: dict[str, tuple[str, str]] = {
+    "codex": ("ccb_protocol", "wrap_codex_prompt"),
+    "gemini": ("gaskd_protocol", "wrap_gemini_prompt"),
+    "opencode": ("oaskd_protocol", "wrap_opencode_prompt"),
+    "droid": ("daskd_protocol", "wrap_droid_prompt"),
+    "claude": ("laskd_protocol", "wrap_claude_prompt"),
+    "cursor": ("uaskd_protocol", "wrap_cursor_prompt"),
+}
+
+
+def try_pane_fallback(
+    spec: ProviderClientSpec,
+    work_dir: Path,
+    message: str,
+    target: str | None = None,
+    no_wrap: bool = False,
+) -> bool:
+    """
+    Last-resort fallback: wrap message and send directly to provider's tmux pane.
+    Returns True on success.
+    """
+    from importlib import import_module
+    from terminal import get_backend_for_session
+
+    if not no_wrap:
+        entry = _WRAP_FUNCS.get(spec.provider)
+        if entry:
+            mod_name, func_name = entry
+            try:
+                wrap_fn = getattr(import_module(mod_name), func_name)
+                from ccb_protocol import make_req_id
+                req_id = os.environ.get("CCB_REQ_ID") or make_req_id()
+                message = wrap_fn(message, req_id)
+            except Exception:
+                pass
+
+    session_mod_name = f"{spec.protocol_prefix}d_session"
+    try:
+        session_mod = import_module(session_mod_name)
+    except ImportError:
+        return False
+    load_fn = getattr(session_mod, "load_project_session", None)
+    if not callable(load_fn):
+        return False
+
+    session = load_fn(work_dir, target=target)
+    if not session:
+        return False
+    data = session.data if hasattr(session, "data") else None
+    if not isinstance(data, dict):
+        return False
+
+    backend = get_backend_for_session(data)
+    pane_id = (
+        getattr(session, "pane_id", None)
+        or data.get("pane_id")
+        or data.get("tmux_session")
+    )
+    if not backend or not pane_id:
+        return False
+
+    try:
+        backend.send_text(str(pane_id), message)
+        return True
+    except Exception:
+        return False
 
 
 def check_background_mode() -> bool:

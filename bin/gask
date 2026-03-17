@@ -74,6 +74,7 @@ def _daemon_request_with_retries(
     timeout: float,
     quiet: bool,
     output_path: Path | None,
+    target: str | None = None,
 ) -> tuple[str, int] | None:
     """
     Best-effort daemon request with retries to avoid autostart races.
@@ -82,7 +83,16 @@ def _daemon_request_with_retries(
     """
     state_file = state_file_from_env(GASK_CLIENT_SPEC.state_file_env)
 
-    result = try_daemon_request(GASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
+    result = try_daemon_request(
+        GASK_CLIENT_SPEC,
+        work_dir,
+        message,
+        timeout,
+        quiet,
+        state_file,
+        output_path=output_path,
+        target=target,
+    )
     if result is not None:
         return result
 
@@ -101,14 +111,23 @@ def _daemon_request_with_retries(
         except Exception:
             pass
 
-    started = maybe_start_daemon(GASK_CLIENT_SPEC, work_dir)
+    started = maybe_start_daemon(GASK_CLIENT_SPEC, work_dir, target=target)
     if started:
         wait_for_daemon_ready(GASK_CLIENT_SPEC, _daemon_startup_wait_s(timeout), state_file)
 
     wait_s = _daemon_retry_wait_s(timeout)
     deadline = time.time() + min(3.0, max(0.2, float(timeout)))
     while time.time() < deadline:
-        result = try_daemon_request(GASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
+        result = try_daemon_request(
+            GASK_CLIENT_SPEC,
+            work_dir,
+            message,
+            timeout,
+            quiet,
+            state_file,
+            output_path=output_path,
+            target=target,
+        )
         if result is not None:
             return result
         time.sleep(wait_s)
@@ -138,7 +157,7 @@ def _wait_for_done_reply(log_reader, state: dict, timeout: float, req_id: str, q
 
 
 def _usage() -> None:
-    print("Usage: gask [--sync] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
+    print("Usage: gask [--sync] [--target TARGET] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -151,6 +170,7 @@ def main(argv: list[str]) -> int:
     quiet = False
     sync_mode = False
     session_file: str | None = None
+    target: str | None = None
 
     parts: list[str] = []
     it = iter(argv[1:])
@@ -163,6 +183,13 @@ def main(argv: list[str]) -> int:
             continue
         if token == "--sync":
             sync_mode = True
+            continue
+        if token == "--target":
+            try:
+                target = next(it)
+            except StopIteration:
+                print("[ERROR] --target requires a target id", file=sys.stderr)
+                return EXIT_ERROR
             continue
         if token == "--session-file":
             try:
@@ -209,24 +236,34 @@ def main(argv: list[str]) -> int:
         work_dir, _ = resolve_work_dir_with_registry(
             GASK_CLIENT_SPEC,
             provider="gemini",
+            target=target,
             cli_session_file=session_file,
             env_session_file=os.environ.get("CCB_SESSION_FILE"),
         )
 
         # Prefer daemon mode: daemon performs per-session serialization and should accept concurrent submissions.
-        daemon_result = _daemon_request_with_retries(work_dir, message, timeout, quiet, output_path)
+        daemon_result = _daemon_request_with_retries(work_dir, message, timeout, quiet, output_path, target=target)
         if daemon_result is not None:
             reply, exit_code = daemon_result
-            # Inject guardrail prompt for Claude (skip in sync mode for Codex)
+            if exit_code >= 2 and not reply.strip():
+                print(f"[WARN] Daemon returned exit_code={exit_code} with empty reply, trying tmux fallback", file=sys.stderr)
+            else:
+                if not sync_mode:
+                    print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
+                if output_path:
+                    atomic_write_text(output_path, reply + "\n")
+                    return exit_code
+                sys.stdout.write(reply)
+                if not reply.endswith("\n"):
+                    sys.stdout.write("\n")
+                return exit_code
+
+        # Fallback: send directly to Gemini pane
+        from askd_client import try_pane_fallback
+        if try_pane_fallback(GASK_CLIENT_SPEC, work_dir, message, target=target):
             if not sync_mode:
                 print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
-            if output_path:
-                atomic_write_text(output_path, reply + "\n")
-                return exit_code
-            sys.stdout.write(reply)
-            if not reply.endswith("\n"):
-                sys.stdout.write("\n")
-            return exit_code
+            return 0
 
         if not env_bool(GASK_CLIENT_SPEC.enabled_env, True):
             print(f"[ERROR] {GASK_CLIENT_SPEC.enabled_env}=0: gask daemon mode disabled.", file=sys.stderr)

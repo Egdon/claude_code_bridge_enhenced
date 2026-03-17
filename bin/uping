@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""
+uping - Test Cursor CLI connectivity
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+from compat import setup_windows_encoding
+setup_windows_encoding()
+
+from uaskd_session import load_project_session
+from terminal import get_backend_for_session
+
+
+def main() -> int:
+    try:
+        parser = argparse.ArgumentParser(prog="uping", add_help=True)
+        parser.add_argument("--session-file", dest="session_file", default=None, help="Path to .cursor-session")
+        args = parser.parse_args()
+
+        work_dir = Path(os.environ.get("CCB_WORK_DIR", os.getcwd()))
+        session = load_project_session(work_dir)
+
+        if not session:
+            print("[FAIL] No active Cursor CLI session found.")
+            return 1
+
+        pane_id = session.pane_id
+        if not pane_id:
+            print("[FAIL] No pane_id in .cursor-session")
+            return 1
+
+        backend = get_backend_for_session(session.data)
+        if not backend:
+            print("[FAIL] Terminal backend not available")
+            return 1
+
+        alive = backend.is_alive(pane_id)
+        if alive:
+            session_path = session.cursor_session_path
+            log_info = f" log={session_path}" if session_path else ""
+            print(f"[OK] Cursor CLI pane {pane_id} is alive{log_info}")
+            return 0
+        else:
+            print(f"[FAIL] Cursor CLI pane {pane_id} is not alive")
+            return 1
+    except Exception as e:
+        print(f"[ERROR] Cursor CLI connectivity test failed: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

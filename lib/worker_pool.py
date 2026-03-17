@@ -42,6 +42,11 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
                 task.done_event.set()
                 continue
 
+            # Signal that the worker has picked up this task
+            started = getattr(task, 'started_event', None)
+            if started is not None:
+                started.set()
+
             try:
                 task.result = self._handle_task(task)
             except Exception as exc:

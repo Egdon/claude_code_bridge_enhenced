@@ -1133,6 +1133,7 @@ class GeminiCommunicator:
                 work_dir = Path(wd) if isinstance(wd, str) and wd else Path.cwd()
                 maybe_auto_transfer(
                     provider="gemini",
+                    target=str(data.get("target") or "").strip() or None,
                     work_dir=work_dir,
                     session_path=old_path_obj,
                     session_id=old_id or None,

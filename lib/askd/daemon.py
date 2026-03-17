@@ -74,6 +74,7 @@ class _UnifiedWorkerPool:
 
         req_id = request.req_id or make_req_id()
         cancel_event = threading.Event()
+        started_event = threading.Event()
         task = QueuedTask(
             request=request,
             created_ms=_now_ms(),
@@ -81,10 +82,11 @@ class _UnifiedWorkerPool:
             done_event=threading.Event(),
             cancelled=False,
             cancel_event=cancel_event,
+            started_event=started_event,
         )
 
-        session = adapter.load_session(Path(request.work_dir))
-        session_key = adapter.compute_session_key(session) if session else f"{provider_key}:unknown"
+        session = adapter.load_session(Path(request.work_dir), request.target)
+        session_key = adapter.compute_session_key(session, request.target) if session else f"{provider_key}:unknown"
 
         pool = self._get_pool(provider_key)
         worker = pool.get_or_create(
@@ -155,11 +157,15 @@ class UnifiedAskDaemon:
         try:
             request = ProviderRequest(
                 client_id=str(msg.get("id") or ""),
+                provider=provider,
                 work_dir=str(msg.get("work_dir") or ""),
                 timeout_s=float(msg.get("timeout_s") or 300.0),
                 quiet=bool(msg.get("quiet") or False),
                 message=str(msg.get("message") or ""),
                 caller=caller,
+                target=str(msg.get("target") or "").strip() or None,
+                instance=str(msg.get("instance") or "").strip() or None,
+                caller_target=str(msg.get("caller_target") or "").strip() or None,
                 output_path=str(msg.get("output_path")) if msg.get("output_path") else None,
                 req_id=str(msg.get("req_id")) if msg.get("req_id") else None,
                 no_wrap=bool(msg.get("no_wrap") or False),
@@ -187,7 +193,31 @@ class UnifiedAskDaemon:
             }
 
         wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
-        task.done_event.wait(timeout=wait_timeout)
+
+        # Phase 1: short grace period to detect if worker can pick up the task.
+        # If the worker is busy with a previous task, return quickly so the
+        # caller can fall back to direct tmux injection.
+        grace_s = float(os.environ.get("CCB_ASKD_BUSY_GRACE_S", "5"))
+        if wait_timeout is not None and grace_s > 0 and grace_s < wait_timeout:
+            task.done_event.wait(timeout=grace_s)
+            if not task.done_event.is_set() and not (task.started_event and task.started_event.is_set()):
+                _write_log(f"[WARN] Worker busy, task not started within {grace_s}s: provider={provider} req_id={task.req_id}")
+                task.cancelled = True
+                if task.cancel_event:
+                    task.cancel_event.set()
+                return {
+                    "type": "ask.response",
+                    "v": 1,
+                    "id": request.client_id,
+                    "exit_code": 2,
+                    "reply": "",
+                }
+            remaining = wait_timeout - grace_s
+            if not task.done_event.is_set() and remaining > 0:
+                task.done_event.wait(timeout=remaining)
+        else:
+            task.done_event.wait(timeout=wait_timeout)
+
         result = task.result
 
         # If timeout occurred and task is still running, mark it as cancelled

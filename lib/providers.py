@@ -15,6 +15,7 @@ class ProviderDaemonSpec:
 
 @dataclass
 class ProviderClientSpec:
+    provider: str
     protocol_prefix: str
     enabled_env: str
     autostart_env_primary: str
@@ -23,6 +24,8 @@ class ProviderClientSpec:
     session_filename: str
     daemon_bin_name: str
     daemon_module: str
+    daemon_protocol_prefix: str = "ask"
+    daemon_state_file_name: str = "askd.json"
 
 
 CASKD_SPEC = ProviderDaemonSpec(
@@ -76,6 +79,7 @@ DASKD_SPEC = ProviderDaemonSpec(
 
 
 CASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="codex",
     protocol_prefix="cask",
     enabled_env="CCB_CASKD",
     autostart_env_primary="CCB_CASKD_AUTOSTART",
@@ -88,6 +92,7 @@ CASK_CLIENT_SPEC = ProviderClientSpec(
 
 
 GASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="gemini",
     protocol_prefix="gask",
     enabled_env="CCB_GASKD",
     autostart_env_primary="CCB_GASKD_AUTOSTART",
@@ -100,6 +105,7 @@ GASK_CLIENT_SPEC = ProviderClientSpec(
 
 
 OASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="opencode",
     protocol_prefix="oask",
     enabled_env="CCB_OASKD",
     autostart_env_primary="CCB_OASKD_AUTOSTART",
@@ -112,6 +118,7 @@ OASK_CLIENT_SPEC = ProviderClientSpec(
 
 
 LASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="claude",
     protocol_prefix="lask",
     enabled_env="CCB_LASKD",
     autostart_env_primary="CCB_LASKD_AUTOSTART",
@@ -124,12 +131,36 @@ LASK_CLIENT_SPEC = ProviderClientSpec(
 
 
 DASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="droid",
     protocol_prefix="dask",
     enabled_env="CCB_DASKD",
     autostart_env_primary="CCB_DASKD_AUTOSTART",
     autostart_env_legacy="CCB_AUTO_DASKD",
     state_file_env="CCB_DASKD_STATE_FILE",
     session_filename=".droid-session",
+    daemon_bin_name="askd",
+    daemon_module="askd.daemon",
+)
+
+
+UASKD_SPEC = ProviderDaemonSpec(
+    daemon_key="uaskd",
+    protocol_prefix="uask",
+    state_file_name="uaskd.json",
+    log_file_name="uaskd.log",
+    idle_timeout_env="CCB_UASKD_IDLE_TIMEOUT_S",
+    lock_name="uaskd",
+)
+
+
+UASK_CLIENT_SPEC = ProviderClientSpec(
+    provider="cursor",
+    protocol_prefix="uask",
+    enabled_env="CCB_UASKD",
+    autostart_env_primary="CCB_UASKD_AUTOSTART",
+    autostart_env_legacy="CCB_AUTO_UASKD",
+    state_file_env="CCB_UASKD_STATE_FILE",
+    session_filename=".cursor-session",
     daemon_bin_name="askd",
     daemon_module="askd.daemon",
 )

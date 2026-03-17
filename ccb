@@ -29,7 +29,19 @@ sys.path.insert(0, str(script_dir / "lib"))
 from terminal import TmuxBackend, WeztermBackend, detect_terminal, is_wsl, get_shell_type
 from compat import setup_windows_encoding
 from ccb_config import get_backend_env
-from ccb_start_config import DEFAULT_PROVIDERS, ensure_default_start_config, load_start_config
+from ccb_start_config import DEFAULT_TARGETS, ensure_default_start_config, load_start_config
+from control_plane import (
+    load_control_plane_context,
+    record_control_plane_runtime,
+    record_target_activation,
+    record_target_removal,
+    next_control_plane_token,
+    request_control_plane_operation,
+)
+from runtime_manager import ensure_runtime_dir_for_target, runtime_dir_for_target
+from session_store import list_target_sessions, load_target_session, write_target_session
+from target_id import instance_of, provider_of, validate_target
+import target_command_utils as target_cmd_utils
 from session_utils import (
     check_session_writable,
     find_project_session_file,
@@ -38,7 +50,14 @@ from session_utils import (
     resolve_project_config_dir,
     safe_write_session,
 )
-from pane_registry import upsert_registry
+from pane_registry import (
+    _coerce_updated_at,
+    _is_stale,
+    _iter_registry_files,
+    _load_registry_file,
+    get_instances_map,
+    upsert_registry,
+)
 from project_id import compute_ccb_project_id
 from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, DASK_CLIENT_SPEC
 from process_lock import ProviderLock
@@ -551,12 +570,34 @@ def _shrink_ccb_logs() -> int:
 class AILauncher:
     def __init__(
         self,
-        providers: list,
+        providers: list | None = None,
         resume: bool = False,
         auto: bool = False,
         cmd_config: dict | None = None,
+        targets: list[str] | None = None,
     ):
-        self.providers = providers or ["codex"]
+        normalized_targets: list[str] = []
+        if targets:
+            for raw_target in targets:
+                try:
+                    normalized_targets.append(validate_target(str(raw_target)))
+                except ValueError:
+                    continue
+        normalized_providers: list[str] = []
+        if normalized_targets:
+            seen_providers: set[str] = set()
+            for target in normalized_targets:
+                provider = provider_of(target)
+                if provider in seen_providers:
+                    continue
+                seen_providers.add(provider)
+                normalized_providers.append(provider)
+        else:
+            normalized_providers = [str(provider).strip().lower() for provider in (providers or ["codex"]) if str(provider).strip()]
+            normalized_targets = [f"{provider}@main" for provider in normalized_providers]
+
+        self.targets = normalized_targets
+        self.providers = normalized_providers
         self.resume = resume
         self.auto = auto
         self.cmd_config = self._normalize_cmd_config(cmd_config)
@@ -582,12 +623,15 @@ class AILauncher:
         self._watchdog_stop_event = None
         self._daemon_proc = None  # Track daemon Popen object for reaping
         self._daemon_proc_lock = threading.Lock()  # Protect daemon_proc access
+        self._control_plane_server = None
+        self._control_plane_op_lock = threading.RLock()
         self.terminal_type = self._detect_terminal_type()
         self.tmux_sessions = {}
         self.tmux_panes = {}
         self.wezterm_panes = {}
         self.extra_panes = {}
         self.processes = {}
+        self.anchor_target = None
         self.anchor_provider = None
         self.anchor_pane_id = None
         self._migrate_legacy_project_files()
@@ -595,11 +639,15 @@ class AILauncher:
         os.environ["CCB_PARENT_PID"] = str(self.ccb_pid)
         os.environ.setdefault("CCB_RUN_DIR", str(self.project_run_dir))
 
-    def _managed_env_overrides(self) -> dict:
+    def _managed_env_overrides(self, *, target: str | None = None) -> dict:
         env = {
             "CCB_MANAGED": "1",
             "CCB_PARENT_PID": str(self.ccb_pid),
         }
+        if target:
+            env["CCB_SELF_TARGET"] = target
+            if self.anchor_target and target == self.anchor_target:
+                env["CCB_IS_ANCHOR"] = "1"
         if os.environ.get("CCB_RUN_DIR"):
             env["CCB_RUN_DIR"] = os.environ["CCB_RUN_DIR"]
         return env
@@ -623,7 +671,7 @@ class AILauncher:
         if not cfg.is_dir():
             return
 
-        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".droid-session"):
+        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".droid-session", ".cursor-session"):
             legacy = self.project_root / name
             if not legacy.exists():
                 continue
@@ -712,14 +760,213 @@ class AILauncher:
             parts.append(f"export {key}={shlex.quote(str(val))}; ")
         return "".join(parts)
 
+    def _pane_map(self, *, terminal: str | None = None) -> dict[str, str]:
+        terminal_name = (terminal or self.terminal_type or "").strip().lower()
+        if terminal_name == "wezterm":
+            return self.wezterm_panes
+        return self.tmux_panes
+
+    def _record_pane_for_target(self, target: str, pane_id: str, *, terminal: str | None = None) -> None:
+        canonical_target = validate_target(target)
+        self._pane_map(terminal=terminal)[canonical_target] = pane_id
+
+    def _provider_compat_target(self, provider: str) -> str:
+        prov = (provider or "").strip().lower()
+        if not prov:
+            return ""
+        matches = [target for target in self.targets if provider_of(target) == prov]
+        main_target = f"{prov}@main"
+        if main_target in matches:
+            return main_target
+        if len(matches) == 1:
+            return matches[0]
+        return ""
+
     def _provider_pane_id(self, provider: str) -> str:
         prov = (provider or "").strip().lower()
-        anchor = (self.anchor_provider or "").strip().lower()
-        if prov and prov == anchor and self.anchor_pane_id:
+        if not prov:
+            return ""
+        compat_target = self._provider_compat_target(prov)
+        if not compat_target:
+            return ""
+        pane_id = str(self._pane_map().get(compat_target, "") or "")
+        if pane_id:
+            return pane_id
+        if compat_target == (self.anchor_target or "") and self.anchor_pane_id:
             return str(self.anchor_pane_id)
-        if self.terminal_type == "wezterm":
-            return str(self.wezterm_panes.get(prov, "") or "")
-        return str(self.tmux_panes.get(prov, "") or "")
+        return ""
+
+    def _provider_compat_context(self, provider: str) -> tuple[str, Path, str] | None:
+        compat_target = self._provider_compat_target(provider)
+        if not compat_target:
+            return None
+        pane_id = self._provider_pane_id(provider)
+        if not pane_id:
+            return None
+        return compat_target, runtime_dir_for_target(self.runtime_dir, compat_target), pane_id
+
+    def _record_control_plane_target(self, target: str, pane_id: str | None = None) -> None:
+        try:
+            record_target_activation(
+                self.project_root,
+                session_id=self.session_id,
+                runtime_root=self.runtime_dir,
+                project_id=self.project_id,
+                terminal=self.terminal_type,
+                target=target,
+                pane_id=pane_id,
+            )
+        except Exception:
+            pass
+
+    def _register_live_target(self, target: str) -> None:
+        canonical_target = validate_target(target)
+        if canonical_target not in self.targets:
+            self.targets.append(canonical_target)
+        provider_name = provider_of(canonical_target)
+        if provider_name not in self.providers:
+            self.providers.append(provider_name)
+
+    def _unregister_live_target(self, target: str) -> None:
+        canonical_target = validate_target(target)
+        self.targets = [item for item in self.targets if item != canonical_target]
+        self.tmux_panes.pop(canonical_target, None)
+        self.wezterm_panes.pop(canonical_target, None)
+        provider_name = provider_of(canonical_target)
+        if not any(provider_of(item) == provider_name for item in self.targets):
+            self.providers = [item for item in self.providers if item != provider_name]
+
+    def _control_plane_parent_pane(self) -> str | None:
+        context = load_control_plane_context(self.project_root)
+        if context:
+            parent_pane = str(context.get("parent_pane") or "").strip()
+            if parent_pane:
+                return parent_pane
+        return str(self.anchor_pane_id or "").strip() or None
+
+    def _control_plane_reply(self, req_id: str | None, *, exit_code: int, message: str, changed: bool = False) -> dict:
+        return {
+            "type": "control.response",
+            "v": 1,
+            "id": req_id,
+            "exit_code": int(exit_code),
+            "message": str(message),
+            "changed": bool(changed),
+            "active_targets": list(self.targets),
+            "anchor_target": self.anchor_target,
+        }
+
+    def _handle_control_plane_request(self, request: dict) -> dict:
+        req_id = str(request.get("id") or "").strip() or None
+        op = str(request.get("op") or "").strip().lower()
+        raw_target = request.get("target")
+        target = validate_target(str(raw_target)) if raw_target else None
+
+        with self._control_plane_op_lock:
+            if op == "status":
+                return self._control_plane_reply(req_id, exit_code=0, message="OK", changed=False)
+
+            if op == "add":
+                if not target:
+                    return self._control_plane_reply(req_id, exit_code=2, message="missing target", changed=False)
+                try:
+                    healthy, _message = target_cmd_utils.ping_target(self.project_root, target)
+                except Exception:
+                    healthy = False
+                if healthy:
+                    return self._control_plane_reply(req_id, exit_code=0, message=f"ℹ️  {target} is already active", changed=False)
+
+                pane_id = self._start_target(target, parent_pane=self._control_plane_parent_pane(), direction="bottom")
+                if not pane_id:
+                    return self._control_plane_reply(req_id, exit_code=1, message=f"❌ failed to add {target}", changed=False)
+                self._register_live_target(target)
+                provider_name = provider_of(target)
+                if provider_name != "claude":
+                    try:
+                        self._warmup_provider(provider_name)
+                    except Exception:
+                        pass
+                if provider_name == "codex" and self.anchor_provider != "codex":
+                    self._maybe_start_caskd()
+                try:
+                    self._sync_cend_registry()
+                except Exception:
+                    pass
+                return self._control_plane_reply(req_id, exit_code=0, message=f"✅ added {target}", changed=True)
+
+            if op == "rm":
+                if not target:
+                    return self._control_plane_reply(req_id, exit_code=2, message="missing target", changed=False)
+                if target == self.anchor_target:
+                    return self._control_plane_reply(req_id, exit_code=2, message=f"❌ cannot remove anchor target {target} from live control plane", changed=False)
+                if target not in self.targets:
+                    return self._control_plane_reply(req_id, exit_code=1, message=f"❌ {target} is not managed by this live session", changed=False)
+
+                ok, message = target_cmd_utils.kill_target(self.project_root, target)
+                ended_at = None
+                try:
+                    target_payload = load_target_session(self.project_root, target) or {}
+                    raw_ended_at = target_payload.get("ended_at") if isinstance(target_payload, dict) else None
+                    ended_at = str(raw_ended_at or "").strip() or None
+                except Exception:
+                    ended_at = None
+                try:
+                    _mark_registry_target_inactive(self.project_id, target, ended_at=ended_at)
+                except Exception:
+                    pass
+                if not ok:
+                    return self._control_plane_reply(req_id, exit_code=1, message=message, changed=False)
+
+                try:
+                    record_target_removal(self.project_root, target)
+                except Exception:
+                    pass
+                self._unregister_live_target(target)
+                removed_provider = provider_of(target)
+                if not any(provider_of(item) == removed_provider for item in self.targets):
+                    _shutdown_provider_daemon(removed_provider)
+                try:
+                    self._sync_cend_registry()
+                except Exception:
+                    pass
+                return self._control_plane_reply(req_id, exit_code=0, message=message, changed=True)
+
+            return self._control_plane_reply(req_id, exit_code=2, message=f"unsupported control op: {op}", changed=False)
+
+    def _start_control_plane_server(self) -> bool:
+        if self._control_plane_server is not None:
+            return True
+        try:
+            from control_plane_server import start_control_plane_server
+
+            server = start_control_plane_server(
+                self.project_root,
+                token=next_control_plane_token(),
+                request_handler=self._handle_control_plane_request,
+            )
+            self._control_plane_server = server
+            return True
+        except Exception as exc:
+            try:
+                record_control_plane_runtime(self.project_root, status="stopped", last_error=str(exc))
+            except Exception:
+                pass
+            print(f"⚠️ Failed to start control-plane server: {exc}", file=sys.stderr)
+            return False
+
+    def _stop_control_plane_server(self) -> None:
+        server = self._control_plane_server
+        self._control_plane_server = None
+        if server is None:
+            try:
+                record_control_plane_runtime(self.project_root, status="stopped")
+            except Exception:
+                pass
+            return
+        try:
+            server.close()
+        except Exception:
+            pass
 
     def _set_current_pane_label(self, provider: str) -> None:
         if self.terminal_type != "tmux":
@@ -752,7 +999,7 @@ class AILauncher:
     def _maybe_start_unified_askd(self) -> None:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
-        for provider in ["codex", "gemini", "opencode", "droid", "claude"]:
+        for provider in ["codex", "gemini", "opencode", "droid", "claude", "cursor"]:
             if provider in [p.lower() for p in self.providers]:
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider)
@@ -780,12 +1027,14 @@ class AILauncher:
             return None
 
         provider = (provider or "").strip().lower()
+        from providers import UASK_CLIENT_SPEC
         specs = {
             "codex": CASK_CLIENT_SPEC,
             "gemini": GASK_CLIENT_SPEC,
             "opencode": OASK_CLIENT_SPEC,
             "claude": LASK_CLIENT_SPEC,
             "droid": DASK_CLIENT_SPEC,
+            "cursor": UASK_CLIENT_SPEC,
         }
         spec = specs.get(provider)
         if not spec:
@@ -1162,7 +1411,7 @@ class AILauncher:
         )
         return True
 
-    def _start_provider(self, provider: str, *, parent_pane: str | None = None, direction: str | None = None) -> str | None:
+    def _start_provider(self, provider: str, *, target: str | None = None, parent_pane: str | None = None, direction: str | None = None) -> str | None:
         # Handle case when no terminal detected
         if self.terminal_type is None:
             print(f"❌ {t('no_terminal_backend')}")
@@ -1177,7 +1426,7 @@ class AILauncher:
         # WezTerm mode: no tmux dependency
         if self.terminal_type == "wezterm":
             print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm')}")
-            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+            return self._start_provider_wezterm(provider, target=target, parent_pane=parent_pane, direction=direction)
 
         # tmux mode: check if tmux is available
         if not shutil.which("tmux"):
@@ -1185,7 +1434,7 @@ class AILauncher:
             if detect_terminal() == "wezterm":
                 self.terminal_type = "wezterm"
                 print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm - tmux unavailable')}")
-                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+                return self._start_provider_wezterm(provider, target=target, parent_pane=parent_pane, direction=direction)
             else:
                 print(f"❌ {t('tmux_not_installed')}")
                 print(f"   {t('install_wezterm_or_tmux')}")
@@ -1201,26 +1450,65 @@ class AILauncher:
         print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
 
         if provider == "codex":
-            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction)
+            return self._start_codex_tmux(target=target or "codex@main", parent_pane=parent_pane, direction=direction)
         elif provider == "gemini":
-            return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction)
+            return self._start_gemini_tmux(target=target or "gemini@main", parent_pane=parent_pane, direction=direction)
         elif provider == "opencode":
-            return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
+            return self._start_opencode_tmux(target=target or "opencode@main", parent_pane=parent_pane, direction=direction)
         elif provider == "droid":
-            return self._start_droid_tmux(parent_pane=parent_pane, direction=direction)
+            return self._start_droid_tmux(target=target or "droid@main", parent_pane=parent_pane, direction=direction)
+        elif provider == "cursor":
+            return self._start_cursor_tmux(target=target or "cursor@main", parent_pane=parent_pane, direction=direction)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
+
+    def _start_target(self, target: str, *, parent_pane: str | None = None, direction: str | None = None) -> str | None:
+        try:
+            canonical_target = validate_target(target)
+        except ValueError:
+            print(f"❌ invalid target: {target}")
+            return None
+
+        provider = provider_of(canonical_target)
+        if provider == "codex" and self.terminal_type == "tmux" and instance_of(canonical_target) != "main":
+            pane_id = self._start_codex_tmux(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "gemini" and self.terminal_type == "tmux" and instance_of(canonical_target) != "main":
+            pane_id = self._start_gemini_tmux(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "opencode" and self.terminal_type == "tmux" and instance_of(canonical_target) != "main":
+            pane_id = self._start_opencode_tmux(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "droid" and self.terminal_type == "tmux" and instance_of(canonical_target) != "main":
+            pane_id = self._start_droid_tmux(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "cursor" and self.terminal_type == "tmux" and instance_of(canonical_target) != "main":
+            pane_id = self._start_cursor_tmux(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "claude" and instance_of(canonical_target) != "main":
+            pane_id = self._start_claude_pane(target=canonical_target, parent_pane=parent_pane, direction=direction)
+        elif provider == "claude":
+            pane_id = self._start_claude_pane(parent_pane=parent_pane, direction=direction)
+        else:
+            pane_id = self._start_provider(provider, target=canonical_target, parent_pane=parent_pane, direction=direction)
+
+        if pane_id:
+            self._record_control_plane_target(canonical_target, pane_id=str(pane_id))
+        return pane_id
 
     def _start_provider_wezterm(
         self,
         provider: str,
         *,
+        target: str | None = None,
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / provider
-        runtime.mkdir(parents=True, exist_ok=True)
+        canonical_target = validate_target(target or f"{provider}@main")
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-{provider.capitalize()}@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / provider
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = f"CCB-{provider.capitalize()}"
 
         start_cmd = self._get_start_cmd(provider)
         keep_open = os.environ.get("CODEX_WEZTERM_KEEP_OPEN", "1").lower() not in {"0", "false", "no", "off"}
@@ -1234,13 +1522,12 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = f"CCB-{provider.capitalize()}"
         title_cmd = _build_pane_title_cmd(pane_title_marker)
-        env_overrides = self._managed_env_overrides()
+        env_overrides = self._managed_env_overrides(target=canonical_target)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        self.wezterm_panes[provider] = pane_id
+        self._record_pane_for_target(canonical_target, pane_id, terminal="wezterm")
 
         if provider == "codex":
             input_fifo = runtime / "input.fifo"
@@ -1254,13 +1541,16 @@ class AILauncher:
                 pane_id=pane_id,
                 pane_title_marker=pane_title_marker,
                 codex_start_cmd=start_cmd,
+                target=canonical_target,
             )
         elif provider == "gemini":
-            self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+            self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, target=canonical_target)
         elif provider == "opencode":
-            self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+            self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, target=canonical_target)
         elif provider == "droid":
-            self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+            self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, target=canonical_target)
+        elif provider == "cursor":
+            self._write_cursor_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, target=canonical_target)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1366,7 +1656,10 @@ class AILauncher:
         pane_id: str | None = None,
         pane_title_marker: str | None = None,
         terminal: str | None = None,
+        target: str = "claude@main",
+        runtime = None,
     ) -> None:
+        canonical_target = validate_target(target)
         path = self._claude_session_file()
         writable, reason, fix = check_session_writable(path)
         if not writable:
@@ -1380,6 +1673,7 @@ class AILauncher:
         if session_id:
             data["claude_session_id"] = session_id
         data["session_id"] = self.session_id
+        data["target"] = canonical_target
         try:
             data["ccb_project_id"] = compute_ccb_project_id(work_dir)
         except Exception:
@@ -1391,6 +1685,8 @@ class AILauncher:
         data["active"] = bool(active)
         data["started_at"] = data.get("started_at") or now
         data["updated_at"] = now
+        if runtime is not None:
+            data["runtime_dir"] = str(runtime)
         if pane_id:
             data["pane_id"] = pane_id
         if pane_title_marker:
@@ -1401,6 +1697,13 @@ class AILauncher:
         if not ok:
             print(err, file=sys.stderr)
             return
+
+        try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return
+
         if pane_id:
             try:
                 upsert_registry(
@@ -1418,11 +1721,43 @@ class AILauncher:
                                 "claude_session_path": data.get("claude_session_path"),
                             }
                         },
+                        "instances": {
+                            canonical_target: {
+                                "pane_id": pane_id,
+                                "pane_title_marker": pane_title_marker,
+                                "session_file": str(target_session_file),
+                                "claude_session_id": data.get("claude_session_id"),
+                                "claude_session_path": data.get("claude_session_path"),
+                            }
+                        },
                     }
                 )
             except Exception:
                 pass
         self._maybe_start_provider_daemon("claude")
+
+    def _backfill_local_claude_session_metadata(self) -> None:
+        path = self._claude_session_file()
+        if not path.exists():
+            return
+
+        data = self._read_json_file(path)
+        if not isinstance(data, dict):
+            return
+
+        if str(data.get("work_dir") or "").strip() and str(data.get("work_dir_norm") or "").strip():
+            return
+
+        runtime = data.get("runtime_dir")
+        self._write_local_claude_session(
+            session_id=data.get("claude_session_id"),
+            active=bool(data.get("active", True)),
+            pane_id=data.get("pane_id"),
+            pane_title_marker=data.get("pane_title_marker"),
+            terminal=data.get("terminal") or self.terminal_type,
+            target=str(data.get("target") or "claude@main"),
+            runtime=Path(runtime) if isinstance(runtime, str) and runtime.strip() else None,
+        )
 
     def _get_latest_codex_session_id(self) -> tuple[str | None, bool]:
         """
@@ -1864,6 +2199,8 @@ class AILauncher:
             return self._build_opencode_start_cmd()
         elif provider == "droid":
             return self._build_droid_start_cmd()
+        elif provider == "cursor":
+            return self._build_cursor_start_cmd()
         return ""
 
     def _opencode_resume_allowed(self) -> bool:
@@ -2013,6 +2350,132 @@ class AILauncher:
                 print(f"ℹ️ {t('no_history_fresh', provider='Droid')}")
         return cmd
 
+    def _build_cursor_start_cmd(self) -> str:
+        cmd = (os.environ.get("CURSOR_START_CMD") or "cursor-agent").strip() or "cursor-agent"
+        api_key = (os.environ.get("CURSOR_API_KEY") or "").strip()
+        auth_token = (os.environ.get("CURSOR_AUTH_TOKEN") or "").strip()
+        if api_key:
+            cmd = f"{cmd} --api-key {api_key}"
+        elif auth_token:
+            cmd = f"{cmd} --auth-token {auth_token}"
+        if self.resume:
+            resume_cmd = (os.environ.get("CURSOR_RESUME_CMD") or "").strip()
+            if resume_cmd:
+                cmd = resume_cmd
+            else:
+                cmd = f"{cmd} resume"
+            print(f"🔁 Resuming Cursor CLI session")
+        return cmd
+
+    def _build_cursor_cmd_list(self) -> list[str]:
+        """Build cursor-agent command as a list for direct subprocess.run execution."""
+        exe = (os.environ.get("CURSOR_START_CMD") or "cursor-agent").strip() or "cursor-agent"
+        parts = [exe]
+        api_key = (os.environ.get("CURSOR_API_KEY") or "").strip()
+        auth_token = (os.environ.get("CURSOR_AUTH_TOKEN") or "").strip()
+        if api_key:
+            parts.extend(["--api-key", api_key])
+        elif auth_token:
+            parts.extend(["--auth-token", auth_token])
+        if self.resume:
+            resume_cmd = (os.environ.get("CURSOR_RESUME_CMD") or "").strip()
+            if resume_cmd:
+                parts = resume_cmd.split()
+            else:
+                parts.append("resume")
+            print(f"🔁 Resuming Cursor CLI session")
+        return parts
+
+    def _build_cursor_env(self, *, target: str | None = None) -> dict:
+        """Build env dict for cursor-agent with CCB overrides and bin PATH."""
+        env = self._with_bin_path_env()
+        env.update(self._managed_env_overrides(target=target))
+        env.update(self._claude_env_overrides(target=target))
+        return env
+
+    def _get_latest_cursor_session_info(self) -> tuple[str | None, str | None]:
+        """Returns (session_id, session_path) from the latest cursor-agent transcript."""
+        try:
+            from cursor_comm import CursorLogReader
+            reader = CursorLogReader(work_dir=self.project_root)
+            session_path = reader.current_session_path()
+            if session_path and session_path.exists():
+                return session_path.stem, str(session_path)
+        except Exception:
+            pass
+        return None, None
+
+    def _write_cursor_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, target: str = "cursor@main"):
+        canonical_target = validate_target(target)
+        session_file = self._project_session_file(".cursor-session")
+
+        writable, reason, fix = check_session_writable(session_file)
+        if not writable:
+            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
+            print(f"💡 Fix: {fix}", file=sys.stderr)
+            return False
+
+        cursor_session_id, cursor_session_path = self._get_latest_cursor_session_info()
+
+        data = {
+            "session_id": self.session_id,
+            "target": canonical_target,
+            "ccb_session_id": self.session_id,
+            "ccb_project_id": compute_ccb_project_id(self.project_root),
+            "runtime_dir": str(runtime),
+            "terminal": self.terminal_type,
+            "tmux_session": tmux_session,
+            "pane_id": pane_id,
+            "pane_title_marker": pane_title_marker,
+            "work_dir": str(self.project_root),
+            "work_dir_norm": _normalize_path_for_match(str(self.project_root)),
+            "start_dir": str(self.invocation_dir),
+            "active": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_cmd": str(start_cmd) if start_cmd else None,
+            "cursor_session_id": cursor_session_id,
+            "cursor_session_path": cursor_session_path,
+        }
+
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if not ok:
+            print(err, file=sys.stderr)
+            return False
+        try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return False
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(self.project_root),
+                "work_dir": str(self.project_root),
+                "terminal": self.terminal_type,
+                "providers": {
+                    "cursor": {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(session_file),
+                        "cursor_session_id": cursor_session_id,
+                        "cursor_session_path": cursor_session_path,
+                    }
+                },
+                "instances": {
+                    canonical_target: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(target_session_file),
+                        "cursor_session_id": cursor_session_id,
+                        "cursor_session_path": cursor_session_path,
+                    }
+                },
+            })
+        except Exception:
+            pass
+        self._maybe_start_provider_daemon("cursor")
+        return True
+
     def _ensure_opencode_auto_config(self) -> None:
         """
         Ensure project-local opencode.json exists with full allow permissions (auto mode).
@@ -2053,12 +2516,20 @@ class AILauncher:
 
     def _start_codex_tmux(
         self,
+        target: str = "codex@main",
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "codex"
-        runtime.mkdir(parents=True, exist_ok=True)
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Codex@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "codex"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Codex"
 
         input_fifo = runtime / "input.fifo"
         output_fifo = runtime / "output.fifo"
@@ -2068,9 +2539,8 @@ class AILauncher:
         if not output_fifo.exists():
             os.mkfifo(output_fifo, 0o644)
 
-        env_overrides = self._managed_env_overrides()
+        env_overrides = self._managed_env_overrides(target=canonical_target)
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
-        pane_title_marker = "CCB-Codex"
 
         backend = TmuxBackend()
 
@@ -2097,7 +2567,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
 
-        self.tmux_panes["codex"] = pane_id
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
 
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
         bridge_env = os.environ.copy()
@@ -2145,6 +2615,7 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         print(f"✅ {t('started_backend', provider='Codex', terminal='tmux pane', pane_id=pane_id)}")
@@ -2152,16 +2623,23 @@ class AILauncher:
 
     def _start_gemini_tmux(
         self,
+        target: str = "gemini@main",
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "gemini"
-        runtime.mkdir(parents=True, exist_ok=True)
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Gemini@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "gemini"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Gemini"
 
-        env_overrides = self._managed_env_overrides()
+        env_overrides = self._managed_env_overrides(target=canonical_target)
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_gemini_start_cmd()
-        pane_title_marker = "CCB-Gemini"
 
         backend = TmuxBackend()
 
@@ -2188,7 +2666,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Gemini")
 
-        self.tmux_panes["gemini"] = pane_id
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
 
         self._write_gemini_session(
             runtime,
@@ -2196,6 +2674,7 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         print(f"✅ {t('started_backend', provider='Gemini', terminal='tmux pane', pane_id=pane_id)}")
@@ -2203,16 +2682,23 @@ class AILauncher:
 
     def _start_opencode_tmux(
         self,
+        target: str = "opencode@main",
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "opencode"
-        runtime.mkdir(parents=True, exist_ok=True)
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-OpenCode@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "opencode"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-OpenCode"
 
-        env_overrides = self._managed_env_overrides()
+        env_overrides = self._managed_env_overrides(target=canonical_target)
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_opencode_start_cmd()
-        pane_title_marker = "CCB-OpenCode"
 
         backend = TmuxBackend()
 
@@ -2242,7 +2728,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "OpenCode")
 
-        self.tmux_panes["opencode"] = pane_id
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
 
         self._write_opencode_session(
             runtime,
@@ -2250,6 +2736,7 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
@@ -2257,16 +2744,23 @@ class AILauncher:
 
     def _start_droid_tmux(
         self,
+        target: str = "droid@main",
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / "droid"
-        runtime.mkdir(parents=True, exist_ok=True)
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Droid@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "droid"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Droid"
 
-        env_overrides = self._managed_env_overrides()
+        env_overrides = self._managed_env_overrides(target=canonical_target)
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_droid_start_cmd()
-        pane_title_marker = "CCB-Droid"
 
         backend = TmuxBackend()
 
@@ -2294,7 +2788,7 @@ class AILauncher:
         backend.set_pane_title(pane_id, pane_title_marker)
         backend.set_pane_user_option(pane_id, "@ccb_agent", "Droid")
 
-        self.tmux_panes["droid"] = pane_id
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
 
         self._write_droid_session(
             runtime,
@@ -2302,9 +2796,70 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         print(f"✅ {t('started_backend', provider='Droid', terminal='tmux pane', pane_id=pane_id)}")
+        return pane_id
+
+    def _start_cursor_tmux(
+        self,
+        target: str = "cursor@main",
+        *,
+        parent_pane: str | None = None,
+        direction: str | None = None,
+    ) -> str | None:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Cursor@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "cursor"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Cursor"
+
+        env_overrides = self._managed_env_overrides(target=canonical_target)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_cursor_start_cmd()
+
+        backend = TmuxBackend()
+
+        use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
+        use_parent = parent_pane
+        if not use_parent:
+            try:
+                use_parent = backend.get_current_pane_id()
+            except Exception:
+                use_parent = None
+        if not use_parent and use_direction == "bottom":
+            try:
+                use_parent = next(reversed(self.tmux_panes.values()))
+            except StopIteration:
+                use_parent = None
+
+        try:
+            if use_parent and str(use_parent).startswith("%") and not backend.pane_exists(str(use_parent)):
+                use_parent = backend.get_current_pane_id()
+        except Exception:
+            use_parent = None
+
+        pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
+        backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
+        backend.set_pane_title(pane_id, pane_title_marker)
+        backend.set_pane_user_option(pane_id, "@ccb_agent", "Cursor")
+
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
+
+        self._write_cursor_session(
+            runtime,
+            None,
+            pane_id=pane_id,
+            pane_title_marker=pane_title_marker,
+            start_cmd=start_cmd,
+            target=canonical_target,
+        )
+
+        print(f"✅ {t('started_backend', provider='Cursor', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_cmd_pane(
@@ -2344,9 +2899,16 @@ class AILauncher:
         print(f"✅ Started cmd pane ({pane_id})")
         return pane_id
 
-    def _start_codex_current_pane(self) -> int:
-        runtime = self.runtime_dir / "codex"
-        runtime.mkdir(parents=True, exist_ok=True)
+    def _start_codex_current_pane(self, target: str = "codex@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Codex@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "codex"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Codex"
 
         input_fifo = runtime / "input.fifo"
         output_fifo = runtime / "output.fifo"
@@ -2356,7 +2918,8 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Codex", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Codex"
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
+
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2374,7 +2937,7 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._managed_env_overrides())
+            + self._build_env_prefix(self._managed_env_overrides(target=canonical_target))
             + _build_export_path_cmd(self.script_dir / "bin")
             + self._build_codex_start_cmd()
         )
@@ -2387,6 +2950,7 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
@@ -2421,7 +2985,7 @@ class AILauncher:
         # 因而会触发 [WinError 2] 找不到可执行文件。这里改为通过 shell 执行以确保可启动。
         if os.name == "nt":
             env = self._with_bin_path_env()
-            env.update(self._managed_env_overrides())
+            env.update(self._managed_env_overrides(target=canonical_target))
             env["CODEX_SESSION_ID"] = self.session_id
             env["CODEX_RUNTIME_DIR"] = str(runtime)
             env["CODEX_INPUT_FIFO"] = str(input_fifo)
@@ -2435,7 +2999,7 @@ class AILauncher:
 
         cmd_parts = shlex.split(self._build_codex_start_cmd())
         env = self._with_bin_path_env()
-        env.update(self._managed_env_overrides())
+        env.update(self._managed_env_overrides(target=canonical_target))
         env["CODEX_SESSION_ID"] = self.session_id
         env["CODEX_RUNTIME_DIR"] = str(runtime)
         env["CODEX_INPUT_FIFO"] = str(input_fifo)
@@ -2460,16 +3024,23 @@ class AILauncher:
 
         return proc.wait()
 
-    def _start_gemini_current_pane(self) -> int:
-        runtime = self.runtime_dir / "gemini"
-        runtime.mkdir(parents=True, exist_ok=True)
+    def _start_gemini_current_pane(self, target: str = "gemini@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Gemini@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "gemini"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Gemini"
 
         pane_id = self._current_pane_id()
         if not pane_id:
             print("❌ Unable to determine current pane id for Gemini", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Gemini"
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2481,7 +3052,7 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._managed_env_overrides())
+            + self._build_env_prefix(self._managed_env_overrides(target=canonical_target))
             + _build_export_path_cmd(self.script_dir / "bin")
             + self._build_gemini_start_cmd()
         )
@@ -2491,20 +3062,28 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_opencode_current_pane(self) -> int:
-        runtime = self.runtime_dir / "opencode"
-        runtime.mkdir(parents=True, exist_ok=True)
+    def _start_opencode_current_pane(self, target: str = "opencode@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-OpenCode@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "opencode"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-OpenCode"
 
         pane_id = self._current_pane_id()
         if not pane_id:
             print("❌ Unable to determine current pane id for OpenCode", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-OpenCode"
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2516,7 +3095,7 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._managed_env_overrides())
+            + self._build_env_prefix(self._managed_env_overrides(target=canonical_target))
             + _build_export_path_cmd(self.script_dir / "bin")
             + self._build_opencode_start_cmd()
         )
@@ -2526,20 +3105,28 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_droid_current_pane(self) -> int:
-        runtime = self.runtime_dir / "droid"
-        runtime.mkdir(parents=True, exist_ok=True)
+    def _start_droid_current_pane(self, target: str = "droid@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Droid@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "droid"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Droid"
 
         pane_id = self._current_pane_id()
         if not pane_id:
             print("❌ Unable to determine current pane id for Droid", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Droid"
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2551,7 +3138,7 @@ class AILauncher:
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._managed_env_overrides())
+            + self._build_env_prefix(self._managed_env_overrides(target=canonical_target))
             + _build_export_path_cmd(self.script_dir / "bin")
             + self._build_droid_start_cmd()
         )
@@ -2561,9 +3148,71 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            target=canonical_target,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
+
+    def _start_cursor_current_pane(self, target: str = "cursor@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Cursor@{instance_of(canonical_target)}"
+        else:
+            runtime = self.runtime_dir / "cursor"
+            runtime.mkdir(parents=True, exist_ok=True)
+            pane_title_marker = "CCB-Cursor"
+
+        pane_id = self._current_pane_id()
+        if not pane_id:
+            print("❌ Unable to determine current pane id for Cursor", file=sys.stderr)
+            return 1
+
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
+        if self.terminal_type == "tmux":
+            try:
+                backend = TmuxBackend()
+                backend.set_pane_title(pane_id, pane_title_marker)
+                backend.set_pane_user_option(pane_id, "@ccb_agent", "Cursor")
+            except Exception:
+                pass
+
+        cmd_parts = self._build_cursor_cmd_list()
+        env = self._build_cursor_env(target=canonical_target)
+        run_cwd = str(Path.cwd())
+
+        start_cmd_str = " ".join(cmd_parts)
+        self._write_cursor_session(
+            runtime,
+            None,
+            pane_id=pane_id,
+            pane_title_marker=pane_title_marker,
+            start_cmd=start_cmd_str,
+            target=canonical_target,
+        )
+
+        print(f"📋 Session ID: {self.session_id}")
+        print(f"📁 Runtime dir: {self.runtime_dir}")
+        print(f"🔌 Active backends: {', '.join(self.providers)}")
+        print()
+        print("🎯 Available commands:")
+        if "codex" in self.providers:
+            print("   cask/cping/cpend - Codex communication")
+        if "claude" in self.providers:
+            print("   lask/lping/lpend - Claude communication")
+        if "opencode" in self.providers:
+            print("   oask/oping/opend - OpenCode communication")
+        if "droid" in self.providers:
+            print("   dask/dping/dpend - Droid communication")
+        print()
+        print(f"Executing: {start_cmd_str}")
+
+        try:
+            return subprocess.run(cmd_parts, env=env, cwd=run_cwd).returncode
+        except KeyboardInterrupt:
+            print(f"\n⚠️ User interrupted")
+            return 130
 
     def _start_provider_in_current_pane(self, provider: str) -> int:
         if provider == "claude":
@@ -2576,10 +3225,41 @@ class AILauncher:
             return self._start_opencode_current_pane()
         if provider == "droid":
             return self._start_droid_current_pane()
+        if provider == "cursor":
+            return self._start_cursor_current_pane()
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
-    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, pane_title_marker=None, codex_start_cmd=None):
+    def _start_target_in_current_pane(self, target: str) -> int:
+        try:
+            canonical_target = validate_target(target)
+        except ValueError:
+            print(f"❌ invalid target: {target}")
+            return 1
+
+        provider = provider_of(canonical_target)
+        if provider == "codex" and instance_of(canonical_target) != "main":
+            rc = self._start_codex_current_pane(canonical_target)
+        elif provider == "gemini" and instance_of(canonical_target) != "main":
+            rc = self._start_gemini_current_pane(canonical_target)
+        elif provider == "opencode" and instance_of(canonical_target) != "main":
+            rc = self._start_opencode_current_pane(canonical_target)
+        elif provider == "droid" and instance_of(canonical_target) != "main":
+            rc = self._start_droid_current_pane(canonical_target)
+        elif provider == "cursor" and instance_of(canonical_target) != "main":
+            rc = self._start_cursor_current_pane(canonical_target)
+        elif provider == "claude" and instance_of(canonical_target) != "main":
+            rc = self._start_claude_current_pane(canonical_target)
+        else:
+            rc = self._start_provider_in_current_pane(provider)
+
+        if rc == 0:
+            pane_id = self._provider_pane_id(provider)
+            self._record_control_plane_target(canonical_target, pane_id=pane_id or None)
+        return rc
+
+    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, pane_title_marker=None, codex_start_cmd=None, target: str = "codex@main"):
+        canonical_target = validate_target(target)
         session_file = self._project_session_file(".codex-session")
 
         # Pre-check permissions
@@ -2599,6 +3279,7 @@ class AILauncher:
         work_dir = self.project_root
         data.update({
             "session_id": self.session_id,
+            "target": canonical_target,
             "ccb_project_id": compute_ccb_project_id(work_dir),
             "runtime_dir": str(runtime),
             "input_fifo": str(input_fifo),
@@ -2622,6 +3303,13 @@ class AILauncher:
         if not ok:
             print(err, file=sys.stderr)
             return False
+
+        try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return False
+
         try:
             upsert_registry({
                 "ccb_session_id": self.session_id,
@@ -2633,6 +3321,13 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                    }
+                },
+                "instances": {
+                    canonical_target: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(target_session_file),
                     }
                 },
             })
@@ -2669,7 +3364,8 @@ class AILauncher:
         if codex_pane_id and claude_pane_id:
             self._write_cend_registry(claude_pane_id, codex_pane_id)
 
-    def _write_gemini_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
+    def _write_gemini_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, target: str = "gemini@main"):
+        canonical_target = validate_target(target)
         session_file = self._project_session_file(".gemini-session")
 
         # Pre-check permissions
@@ -2681,6 +3377,7 @@ class AILauncher:
 
         data = {
             "session_id": self.session_id,
+            "target": canonical_target,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
             "terminal": self.terminal_type,
@@ -2700,6 +3397,11 @@ class AILauncher:
             print(err, file=sys.stderr)
             return False
         try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return False
+        try:
             upsert_registry({
                 "ccb_session_id": self.session_id,
                 "ccb_project_id": compute_ccb_project_id(self.project_root),
@@ -2712,13 +3414,21 @@ class AILauncher:
                         "session_file": str(session_file),
                     }
                 },
+                "instances": {
+                    canonical_target: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(target_session_file),
+                    }
+                },
             })
         except Exception:
             pass
         self._maybe_start_provider_daemon("gemini")
         return True
 
-    def _write_opencode_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
+    def _write_opencode_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, target: str = "opencode@main"):
+        canonical_target = validate_target(target)
         session_file = self._project_session_file(".opencode-session")
 
         writable, reason, fix = check_session_writable(session_file)
@@ -2729,6 +3439,7 @@ class AILauncher:
 
         data = {
             "session_id": self.session_id,
+            "target": canonical_target,
             "ccb_session_id": self.session_id,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
@@ -2749,6 +3460,11 @@ class AILauncher:
             print(err, file=sys.stderr)
             return False
         try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return False
+        try:
             upsert_registry({
                 "ccb_session_id": self.session_id,
                 "ccb_project_id": compute_ccb_project_id(self.project_root),
@@ -2761,13 +3477,21 @@ class AILauncher:
                         "session_file": str(session_file),
                     }
                 },
+                "instances": {
+                    canonical_target: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(target_session_file),
+                    }
+                },
             })
         except Exception:
             pass
         self._maybe_start_provider_daemon("opencode")
         return True
 
-    def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
+    def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, target: str = "droid@main"):
+        canonical_target = validate_target(target)
         session_file = self._project_session_file(".droid-session")
 
         writable, reason, fix = check_session_writable(session_file)
@@ -2793,6 +3517,7 @@ class AILauncher:
 
         data = {
             "session_id": self.session_id,
+            "target": canonical_target,
             "ccb_session_id": self.session_id,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
@@ -2815,6 +3540,11 @@ class AILauncher:
             print(err, file=sys.stderr)
             return False
         try:
+            target_session_file = write_target_session(self.project_root, canonical_target, data)
+        except Exception as exc:
+            print(f"⚠️ Failed to write target session {canonical_target}: {exc}", file=sys.stderr)
+            return False
+        try:
             upsert_registry({
                 "ccb_session_id": self.session_id,
                 "ccb_project_id": compute_ccb_project_id(self.project_root),
@@ -2825,6 +3555,15 @@ class AILauncher:
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
+                        "droid_session_id": droid_session_id,
+                        "droid_session_path": droid_session_path,
+                    }
+                },
+                "instances": {
+                    canonical_target: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(target_session_file),
                         "droid_session_id": droid_session_id,
                         "droid_session_path": droid_session_path,
                     }
@@ -2953,60 +3692,38 @@ class AILauncher:
             "❌ Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
         )
 
-    def _claude_env_overrides(self) -> dict:
+    def _claude_env_overrides(self, *, target: str | None = None) -> dict:
         env: dict[str, str] = {}
-        env.update(self._managed_env_overrides())
-        if "codex" in self.providers:
-            runtime = self.runtime_dir / "codex"
-            env["CODEX_SESSION_ID"] = self.session_id
-            env["CODEX_RUNTIME_DIR"] = str(runtime)
-            env["CODEX_INPUT_FIFO"] = str(runtime / "input.fifo")
-            env["CODEX_OUTPUT_FIFO"] = str(runtime / "output.fifo")
-            env["CODEX_TERMINAL"] = self.terminal_type or ""
-            pane_id = self._provider_pane_id("codex")
-            if self.terminal_type == "wezterm":
-                env["CODEX_WEZTERM_PANE"] = pane_id
-            else:
-                env["CODEX_TMUX_SESSION"] = pane_id
+        env.update(self._managed_env_overrides(target=target))
 
-        if "gemini" in self.providers:
-            runtime = self.runtime_dir / "gemini"
-            env["GEMINI_SESSION_ID"] = self.session_id
-            env["GEMINI_RUNTIME_DIR"] = str(runtime)
-            env["GEMINI_TERMINAL"] = self.terminal_type or ""
-            pane_id = self._provider_pane_id("gemini")
+        def _assign_provider_env(provider: str, prefix: str, *, has_fifos: bool = False) -> None:
+            if provider not in self.providers:
+                return
+            compat = self._provider_compat_context(provider)
+            if compat is None:
+                return
+            _target, runtime, pane_id = compat
+            env[f"{prefix}_SESSION_ID"] = self.session_id
+            env[f"{prefix}_RUNTIME_DIR"] = str(runtime)
+            env[f"{prefix}_TERMINAL"] = self.terminal_type or ""
+            if has_fifos:
+                env[f"{prefix}_INPUT_FIFO"] = str(runtime / "input.fifo")
+                env[f"{prefix}_OUTPUT_FIFO"] = str(runtime / "output.fifo")
             if self.terminal_type == "wezterm":
-                env["GEMINI_WEZTERM_PANE"] = pane_id
+                env[f"{prefix}_WEZTERM_PANE"] = pane_id
             else:
-                env["GEMINI_TMUX_SESSION"] = pane_id
+                env[f"{prefix}_TMUX_SESSION"] = pane_id
 
-        if "opencode" in self.providers:
-            runtime = self.runtime_dir / "opencode"
-            env["OPENCODE_SESSION_ID"] = self.session_id
-            env["OPENCODE_RUNTIME_DIR"] = str(runtime)
-            env["OPENCODE_TERMINAL"] = self.terminal_type or ""
-            pane_id = self._provider_pane_id("opencode")
-            if self.terminal_type == "wezterm":
-                env["OPENCODE_WEZTERM_PANE"] = pane_id
-            else:
-                env["OPENCODE_TMUX_SESSION"] = pane_id
-
-        if "droid" in self.providers:
-            runtime = self.runtime_dir / "droid"
-            env["DROID_SESSION_ID"] = self.session_id
-            env["DROID_RUNTIME_DIR"] = str(runtime)
-            env["DROID_TERMINAL"] = self.terminal_type or ""
-            pane_id = self._provider_pane_id("droid")
-            if self.terminal_type == "wezterm":
-                env["DROID_WEZTERM_PANE"] = pane_id
-            else:
-                env["DROID_TMUX_SESSION"] = pane_id
-
+        _assign_provider_env("codex", "CODEX", has_fifos=True)
+        _assign_provider_env("gemini", "GEMINI")
+        _assign_provider_env("opencode", "OPENCODE")
+        _assign_provider_env("droid", "DROID")
+        _assign_provider_env("cursor", "CURSOR")
         return env
 
-    def _build_claude_env(self) -> dict:
+    def _build_claude_env(self, *, target: str | None = None) -> dict:
         env = self._with_bin_path_env()
-        env.update(self._claude_env_overrides())
+        env.update(self._claude_env_overrides(target=target))
         return env
 
     def _claude_start_plan(self) -> tuple[list[str], str, bool]:
@@ -3027,7 +3744,7 @@ class AILauncher:
 
     def _start_claude(self) -> int:
         print(f"🚀 {t('starting_claude')}")
-        env = self._build_claude_env()
+        env = self._build_claude_env(target="claude@main")
 
         try:
             cmd, run_cwd, has_history = self._claude_start_plan()
@@ -3054,6 +3771,8 @@ class AILauncher:
             print("   oask/oping/opend - OpenCode communication")
         if "droid" in self.providers:
             print("   dask/dping/dpend - Droid communication")
+        if "cursor" in self.providers:
+            print("   uask/uping/upend - Cursor CLI communication")
         print()
         print(f"Executing: {' '.join(cmd)}")
 
@@ -3066,9 +3785,82 @@ class AILauncher:
             print(f"\n⚠️ {t('user_interrupted')}")
             return 130
 
-    def _start_claude_pane(self, *, parent_pane: str | None, direction: str | None) -> str | None:
+    def _start_claude_current_pane(self, target: str = "claude@main") -> int:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Claude@{instance_of(canonical_target)}"
+        else:
+            runtime = None
+            pane_title_marker = "CCB-Claude"
+
         print(f"🚀 {t('starting_claude')}")
-        env_overrides = self._claude_env_overrides()
+        env = self._build_claude_env(target=canonical_target)
+
+        try:
+            cmd, run_cwd, has_history = self._claude_start_plan()
+        except FileNotFoundError as e:
+            print(str(e))
+            return 1
+
+        if self.resume:
+            if has_history:
+                print(f"🔁 {t('resuming_claude', session_id='')}")
+            else:
+                print(f"ℹ️ {t('no_claude_session')}")
+
+        pane_id = self._current_pane_id()
+        if not pane_id:
+            print("❌ Unable to determine current pane id for Claude", file=sys.stderr)
+            return 1
+
+        self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
+        if self.terminal_type == "tmux":
+            try:
+                backend = TmuxBackend()
+                backend.set_pane_title(pane_id, pane_title_marker)
+                backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
+            except Exception:
+                pass
+
+        try:
+            self._write_local_claude_session(
+                session_id=self._read_local_claude_session_id(),
+                active=True,
+                pane_id=str(pane_id or ""),
+                pane_title_marker=pane_title_marker,
+                terminal=self.terminal_type,
+                target=canonical_target,
+                runtime=runtime,
+            )
+        except Exception:
+            pass
+
+        print(f"📋 Session ID: {self.session_id}")
+        print(f"📁 Runtime dir: {self.runtime_dir}")
+        print(f"🔌 Active backends: {', '.join(self.providers)}")
+        print()
+        print(f"Executing: {' '.join(cmd)}")
+
+        try:
+            return subprocess.run(cmd, env=env, cwd=run_cwd).returncode
+        except KeyboardInterrupt:
+            print(f"\n⚠️ {t('user_interrupted')}")
+            return 130
+
+    def _start_claude_pane(self, target: str = "claude@main", *, parent_pane: str | None, direction: str | None) -> str | None:
+        canonical_target = validate_target(target)
+        use_target_layout = instance_of(canonical_target) != "main"
+        if use_target_layout:
+            runtime = ensure_runtime_dir_for_target(self.runtime_dir, canonical_target)
+            pane_title_marker = f"CCB-Claude@{instance_of(canonical_target)}"
+        else:
+            runtime = None
+            pane_title_marker = "CCB-Claude"
+
+        print(f"🚀 {t('starting_claude')}")
+        env_overrides = self._claude_env_overrides(target=canonical_target)
 
         try:
             cmd_parts, run_cwd, has_history = self._claude_start_plan()
@@ -3084,7 +3876,7 @@ class AILauncher:
 
         start_cmd = " ".join(cmd_parts)
         full_cmd = (
-            _build_pane_title_cmd("CCB-Claude")
+            _build_pane_title_cmd(pane_title_marker)
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3096,22 +3888,24 @@ class AILauncher:
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
             pane_id = backend.create_pane(full_cmd, run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
-            self.wezterm_panes["claude"] = pane_id
+            self._record_pane_for_target(canonical_target, pane_id, terminal="wezterm")
         else:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, "CCB-Claude")
+            backend.set_pane_title(pane_id, pane_title_marker)
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
-            self.tmux_panes["claude"] = pane_id
+            self._record_pane_for_target(canonical_target, pane_id, terminal="tmux")
 
         try:
             self._write_local_claude_session(
                 session_id=self._read_local_claude_session_id(),
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker="CCB-Claude",
+                pane_title_marker=pane_title_marker,
                 terminal=self.terminal_type,
+                target=canonical_target,
+                runtime=runtime,
             )
         except Exception:
             pass
@@ -3133,6 +3927,7 @@ class AILauncher:
 
         # Stop watchdog thread first
         self._stop_daemon_watchdog()
+        self._stop_control_plane_server()
 
         if not quiet:
             print(f"\n🧹 {t('cleaning_up')}")
@@ -3249,7 +4044,7 @@ class AILauncher:
         version_str = f"v{VERSION}" + (f" ({git_info})" if git_info else "")
         print(f"🚀 Claude Code Bridge {version_str}")
         print(f"📅 {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"🔌 Backends: {', '.join(self.providers)}")
+        print(f"🔌 Targets: {', '.join(self.targets)}")
         print("=" * 50)
 
         # Require WezTerm pane or an existing tmux client session.
@@ -3275,11 +4070,17 @@ class AILauncher:
         if not self._require_project_config_dir():
             return 2
 
-        if not self.providers:
-            print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
+        try:
+            self._backfill_local_claude_session_metadata()
+        except Exception:
+            pass
+
+        if not self.targets:
+            print("❌ No targets configured. Define targets in ccb.config or pass them on the command line.", file=sys.stderr)
             return 2
 
-        self.anchor_provider = self.providers[-1]
+        self.anchor_target = self.targets[-1]
+        self.anchor_provider = provider_of(self.anchor_target)
         self.anchor_pane_id = self._current_pane_id()
         if not self.anchor_pane_id:
             print("❌ Unable to determine current pane id. Run inside tmux or WezTerm.", file=sys.stderr)
@@ -3289,7 +4090,7 @@ class AILauncher:
         spawn_items: list[str] = []
         if cmd_settings.get("enabled"):
             spawn_items.append("cmd")
-        spawn_items.extend(list(reversed(self.providers[:-1])))
+        spawn_items.extend(list(reversed(self.targets[:-1])))
         total_panes = 1 + len(spawn_items)
         left_count = 1 if total_panes <= 1 else max(1, total_panes // 2)
         right_count = total_panes - left_count
@@ -3301,7 +4102,7 @@ class AILauncher:
         left_slots = max(0, left_count - 1)
         right_slots = max(0, right_count - (1 if right_top_item else 0))
 
-        left_items = [self.anchor_provider]
+        left_items = [self.anchor_target]
         left_items.extend(remaining[:left_slots])
 
         right_items: list[str] = []
@@ -3368,11 +4169,11 @@ class AILauncher:
         def _start_item(item: str, *, parent: str | None, direction: str | None) -> str | None:
             if item == "cmd":
                 return self._start_cmd_pane(parent_pane=parent, direction=direction, cmd_settings=cmd_settings)
-            if item == "claude":
-                return self._start_claude_pane(parent_pane=parent, direction=direction)
-            pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
+            pane_id = self._start_target(item, parent_pane=parent, direction=direction)
             if pane_id:
-                self._warmup_provider(item)
+                provider = provider_of(item)
+                if provider != "claude":
+                    self._warmup_provider(provider)
             return pane_id
 
         right_top: str | None = None
@@ -3396,7 +4197,7 @@ class AILauncher:
             last_right = pane_id
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
-        if "codex" in self.providers and self.anchor_provider != "codex":
+        if any(provider_of(target) == "codex" for target in self.targets) and self.anchor_provider != "codex":
             self._maybe_start_caskd()
 
         # Start watchdog thread to monitor daemon health (provider-agnostic)
@@ -3404,12 +4205,189 @@ class AILauncher:
 
         try:
             try:
+                self._record_control_plane_target(self.anchor_target, pane_id=str(self.anchor_pane_id or "") or None)
+            except Exception:
+                pass
+            self._start_control_plane_server()
+            try:
                 self._sync_cend_registry()
             except Exception:
                 pass
-            return self._start_provider_in_current_pane(self.anchor_provider)
+            return self._start_target_in_current_pane(self.anchor_target)
         finally:
             self.cleanup(**cleanup_kwargs)
+
+
+def _ps_target_sort_key(target: str) -> tuple[str, int, int, str]:
+    canonical_target = validate_target(target)
+    provider_name = provider_of(canonical_target)
+    instance_name = instance_of(canonical_target)
+    if instance_name == "main":
+        return provider_name, 0, -1, canonical_target
+    if instance_name.isdigit():
+        return provider_name, 1, int(instance_name), canonical_target
+    return provider_name, 1, 10**9, canonical_target
+
+
+_LEGACY_PS_PROVIDERS = ("claude", "codex", "cursor", "droid", "gemini", "opencode")
+
+
+def _load_legacy_ps_entries(work_dir: Path) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    for provider_name in _LEGACY_PS_PROVIDERS:
+        session_file = find_project_session_file(work_dir, f".{provider_name}-session")
+        if not session_file or not session_file.exists():
+            continue
+        try:
+            raw = session_file.read_text(encoding="utf-8-sig", errors="replace")
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(data, dict) or data.get("active") is False:
+            continue
+        raw_target = str(data.get("target") or f"{provider_name}@main").strip().lower()
+        try:
+            canonical_target = validate_target(raw_target)
+        except ValueError:
+            canonical_target = f"{provider_name}@main"
+        rows.setdefault(canonical_target, data)
+    return rows
+
+
+def _load_registry_ps_entries(work_dir: Path) -> dict[str, dict]:
+    try:
+        project_id = compute_ccb_project_id(work_dir)
+    except Exception:
+        return {}
+
+    entries: dict[str, dict] = {}
+    for path in _iter_registry_files():
+        record = _load_registry_file(path)
+        if not isinstance(record, dict):
+            continue
+        updated_at = _coerce_updated_at(record.get("updated_at"), path)
+        if _is_stale(updated_at):
+            continue
+
+        effective_project_id = str(record.get("ccb_project_id") or "").strip()
+        if not effective_project_id:
+            registry_work_dir = str(record.get("work_dir") or "").strip()
+            if registry_work_dir:
+                try:
+                    effective_project_id = compute_ccb_project_id(Path(registry_work_dir))
+                except Exception:
+                    effective_project_id = ""
+        if effective_project_id != project_id:
+            continue
+
+        explicit_instances = record.get("instances")
+        if isinstance(explicit_instances, dict):
+            for target, entry in explicit_instances.items():
+                if not isinstance(target, str) or not target.strip() or not isinstance(entry, dict):
+                    continue
+                try:
+                    canonical_target = validate_target(target)
+                except ValueError:
+                    continue
+                merged = dict(entry)
+                merged.setdefault("terminal", record.get("terminal"))
+                merged.setdefault("active", True)
+                entries[canonical_target] = merged
+
+        raw_target = record.get("target")
+        if isinstance(raw_target, str) and raw_target.strip():
+            try:
+                canonical_target = validate_target(raw_target)
+            except ValueError:
+                canonical_target = ""
+            if canonical_target:
+                scoped = {
+                    "pane_id": record.get("pane_id"),
+                    "pane_title_marker": record.get("pane_title_marker"),
+                    "terminal": record.get("terminal"),
+                    "active": record.get("active", True),
+                }
+                entries.setdefault(canonical_target, scoped)
+    return entries
+
+
+def _collect_ps_rows(work_dir: Path) -> list[dict]:
+    session_targets = {
+        validate_target(target)
+        for target in list_target_sessions(work_dir).keys()
+    }
+    registry_entries = _load_registry_ps_entries(work_dir)
+    legacy_entries = _load_legacy_ps_entries(work_dir)
+
+    targets = set(session_targets)
+    targets.update(registry_entries.keys())
+    targets.update(legacy_entries.keys())
+
+    for provider_name in {provider_of(target) for target in list(targets)}:
+        main_target = f"{provider_name}@main"
+        has_non_main = any(
+            provider_of(target) == provider_name and instance_of(target) != "main"
+            for target in targets
+        )
+        if has_non_main and main_target in registry_entries and main_target not in session_targets and main_target not in legacy_entries:
+            targets.discard(main_target)
+
+    rows: list[dict] = []
+    for target in sorted(targets, key=_ps_target_sort_key):
+        record, entry = target_cmd_utils.resolve_target_entry(work_dir, target)
+        record_data = dict(record or {}) if isinstance(record, dict) else {}
+        entry_data = dict(entry or {}) if isinstance(entry, dict) else {}
+        registry_data = dict(registry_entries.get(target) or {})
+        legacy_data = dict(legacy_entries.get(target) or {})
+        if not record_data and not entry_data and not registry_data and not legacy_data:
+            continue
+
+        rows.append(
+            {
+                "target": target,
+                "provider": provider_of(target),
+                "instance": instance_of(target),
+                "terminal": str(
+                    entry_data.get("terminal")
+                    or record_data.get("terminal")
+                    or registry_data.get("terminal")
+                    or legacy_data.get("terminal")
+                    or "-"
+                ).strip() or "-",
+                "pane_id": str(
+                    entry_data.get("pane_id")
+                    or record_data.get("pane_id")
+                    or record_data.get("tmux_session")
+                    or registry_data.get("pane_id")
+                    or registry_data.get("tmux_session")
+                    or legacy_data.get("pane_id")
+                    or legacy_data.get("tmux_session")
+                    or "-"
+                ).strip() or "-",
+                "status": "active" if (record_data.get("active", registry_data.get("active", legacy_data.get("active", True))) is not False) else "ended",
+            }
+        )
+    return rows
+
+
+def cmd_ps(_args) -> int:
+    work_dir = Path.cwd()
+    rows = _collect_ps_rows(work_dir)
+    if not rows:
+        print("No active targets found.")
+        return 0
+
+    print("TARGET           PROVIDER INSTANCE TERMINAL PANE     STATUS")
+    for row in rows:
+        print(
+            f"{row['target']:<16} "
+            f"{row['provider']:<8} "
+            f"{row['instance']:<8} "
+            f"{row['terminal']:<8} "
+            f"{row['pane_id']:<8} "
+            f"{row['status']}"
+        )
+    return 0
 
 
 def cmd_start(args):
@@ -3559,26 +4537,26 @@ def cmd_start(args):
         return 2
     atexit.register(ccb_lock.release)
 
-    providers, cmd_enabled = _parse_providers_with_cmd(args.providers or [])
+    targets, cmd_enabled = _parse_targets_with_cmd(args.providers or [])
     config = load_start_config(work_dir)
     config_data = config.data if isinstance(config.data, dict) else {}
 
-    if not providers:
-        raw_providers = config_data.get("providers")
-        if isinstance(raw_providers, str):
-            raw_providers = [raw_providers]
-        if not isinstance(raw_providers, list):
-            raw_providers = []
-        if not raw_providers:
-            raw_providers = list(DEFAULT_PROVIDERS)
+    if not targets:
+        raw_targets = config_data.get("targets")
+        if isinstance(raw_targets, str):
+            raw_targets = [raw_targets]
+        if not isinstance(raw_targets, list):
+            raw_targets = []
+        if not raw_targets:
+            raw_targets = list(DEFAULT_TARGETS)
             if not config.path:
                 created_path, created = ensure_default_start_config(work_dir)
                 if created and created_path:
                     print(f"✅ Created default config: {created_path}", file=sys.stderr)
-        providers = _parse_providers([str(p) for p in raw_providers])
+        targets = _parse_targets([str(p) for p in raw_targets])
 
-    if not providers:
-        print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
+    if not targets:
+        print("❌ No targets configured. Define targets in ccb.config or pass them on the command line.", file=sys.stderr)
         return 2
 
     flags = config_data.get("flags") if isinstance(config_data.get("flags"), dict) else {}
@@ -3593,7 +4571,7 @@ def cmd_start(args):
             cmd_config = True
 
     launcher = AILauncher(
-        providers=providers,
+        targets=targets,
         resume=resume,
         auto=auto,
         cmd_config=cmd_config,
@@ -3604,7 +4582,7 @@ def cmd_start(args):
 def _find_all_zombie_sessions() -> list[dict]:
     """Find all zombie tmux sessions (CCB sessions whose parent process is dead)."""
     import re
-    pattern = re.compile(r"^(codex|gemini|opencode|claude|droid)-(\d+)-")
+    pattern = re.compile(r"^(codex|gemini|opencode|claude|droid|cursor)-(\d+)-")
     zombies = []
 
     if os.name == "nt" or not shutil.which("tmux"):
@@ -3741,81 +4719,348 @@ def _kill_pid(pid: int, force: bool = False) -> bool:
         return False
 
 
+_DAEMON_SPECS = {
+    "codex": CASK_CLIENT_SPEC,
+    "gemini": GASK_CLIENT_SPEC,
+    "opencode": OASK_CLIENT_SPEC,
+    "claude": LASK_CLIENT_SPEC,
+    "droid": DASK_CLIENT_SPEC,
+}
+
+
+
+def _shutdown_provider_daemon(provider: str) -> bool:
+    spec = _DAEMON_SPECS.get(str(provider or "").strip().lower())
+    if not spec:
+        return False
+
+    daemon_name = spec.daemon_bin_name
+    st_file = state_file_path(f"{daemon_name}.json")
+    try:
+        if shutdown_daemon(spec.protocol_prefix, 1.0, st_file):
+            print(f"✅ {daemon_name} daemon shutdown requested")
+            return True
+        st = read_state(st_file)
+        if st and st.get("pid"):
+            pid = int(st["pid"])
+            if _kill_pid(pid, force=True):
+                print(f"✅ {daemon_name} daemon force killed (pid={pid})")
+                return True
+            print(f"⚠️ {daemon_name} daemon could not be killed (pid={pid})")
+    except Exception:
+        return False
+    return False
+
+
+
+def _resolve_kill_targets(project_id: str, targets: list[str] | None = None, provider: str | None = None) -> list[str]:
+    _ = project_id
+    resolved, _scope = target_cmd_utils.resolve_scope_targets_for_command(Path.cwd(), positional=targets or [], provider=provider)
+    return resolved
+
+
+
+def _kill_target(work_dir: Path, project_id: str, target: str) -> str | None:
+    ok, message = target_cmd_utils.kill_target(work_dir, target)
+    print(message)
+
+    ended_at = None
+    try:
+        target_payload = load_target_session(work_dir, target) or {}
+        raw_ended_at = target_payload.get("ended_at") if isinstance(target_payload, dict) else None
+        ended_at = str(raw_ended_at or "").strip() or None
+    except Exception:
+        ended_at = None
+
+    try:
+        _mark_registry_target_inactive(project_id, target, ended_at=ended_at)
+    except Exception:
+        pass
+
+    return provider_of(target) if ok else None
+
+
+
+def _providers_requiring_shutdown_after_target_kill(project_id: str, killed_targets: list[str]) -> list[str]:
+    _ = project_id
+    providers: list[str] = []
+    seen: set[str] = set()
+    for target in killed_targets:
+        provider = provider_of(target)
+        if provider in seen:
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    return providers
+
+
+
+def _validate_single_target_arg(raw_target: str | None, *, command: str) -> tuple[int | None, str | None]:
+    token = str(raw_target or "").strip()
+    if not token:
+        print(f"❌ missing target for `ccb {command}`", file=sys.stderr)
+        return 2, None
+    if "@" not in token:
+        print(f"❌ bare provider is not accepted here: {token}", file=sys.stderr)
+        print(f"💡 expected target in `provider@instance` format", file=sys.stderr)
+        print(f"💡 use `ccb {command} {token}@main`", file=sys.stderr)
+        return 2, None
+    try:
+        return None, validate_target(token)
+    except ValueError:
+        print(f"❌ invalid target: {token}", file=sys.stderr)
+        return 2, None
+
+
+
+def _load_registry_record_for_target(project_id: str, target: str) -> dict | None:
+    canonical_target = validate_target(target)
+    best: dict | None = None
+    best_ts = -1
+
+    for path in _iter_registry_files():
+        record = _load_registry_file(path)
+        if not isinstance(record, dict):
+            continue
+        updated_at = _coerce_updated_at(record.get("updated_at"), path)
+        if _is_stale(updated_at):
+            continue
+
+        effective_project_id = str(record.get("ccb_project_id") or "").strip()
+        if not effective_project_id:
+            work_dir = str(record.get("work_dir") or "").strip()
+            if work_dir:
+                try:
+                    effective_project_id = compute_ccb_project_id(Path(work_dir))
+                except Exception:
+                    effective_project_id = ""
+        if effective_project_id != project_id:
+            continue
+
+        if canonical_target not in get_instances_map(record):
+            continue
+
+        if updated_at > best_ts:
+            best = record
+            best_ts = updated_at
+
+    return best
+
+
+
+def _mark_registry_target_inactive(project_id: str, target: str, *, ended_at: str | None = None) -> bool:
+    record = _load_registry_record_for_target(project_id, target)
+    if not isinstance(record, dict):
+        return False
+
+    session_id = str(record.get("ccb_session_id") or "").strip()
+    if not session_id:
+        return False
+
+    canonical_target = validate_target(target)
+    scoped_entry: dict[str, object] = {"active": False}
+    if ended_at:
+        scoped_entry["ended_at"] = ended_at
+
+    update_record = {
+        "ccb_session_id": session_id,
+        "ccb_project_id": str(record.get("ccb_project_id") or project_id),
+        "work_dir": str(record.get("work_dir") or Path.cwd()),
+        "terminal": record.get("terminal"),
+        "instances": {
+            canonical_target: scoped_entry,
+        },
+    }
+    return upsert_registry(update_record)
+
+
+
+def _infer_runtime_root_from_target_payload(target: str, payload: dict) -> Path | None:
+    runtime_value = str(payload.get("runtime_dir") or "").strip()
+    if not runtime_value:
+        return None
+
+    runtime_path = Path(runtime_value)
+    probe = runtime_path
+    while probe.name and probe.name != "instances":
+        probe = probe.parent
+    if probe.name == "instances":
+        return probe.parent
+
+    provider_name = provider_of(target)
+    if runtime_path.name == provider_name:
+        return runtime_path.parent
+    return runtime_path
+
+
+
+def _load_active_target_context(work_dir: Path) -> dict[str, object] | None:
+    control_context = load_control_plane_context(work_dir)
+
+    sessions = list_target_sessions(work_dir)
+    active_items: list[tuple[str, dict]] = []
+    for target, payload in sessions.items():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("active", True) is False:
+            continue
+        active_items.append((validate_target(target), payload))
+
+    if not active_items:
+        return control_context
+
+    active_items.sort(key=lambda item: _ps_target_sort_key(item[0]))
+    parent_target, parent_payload = active_items[0]
+    parent_pane = str(parent_payload.get("pane_id") or parent_payload.get("tmux_session") or "").strip() or None
+    session_id = str(parent_payload.get("session_id") or parent_payload.get("ccb_session_id") or "").strip()
+    runtime_root = _infer_runtime_root_from_target_payload(parent_target, parent_payload)
+    terminal = str(parent_payload.get("terminal") or "").strip() or None
+
+    if not parent_pane and control_context:
+        parent_pane = str(control_context.get("parent_pane") or "").strip() or None
+    if not terminal and control_context:
+        terminal = str(control_context.get("terminal") or "").strip() or None
+
+    if (not session_id or runtime_root is None) and control_context:
+        return control_context
+    if not session_id or runtime_root is None:
+        return None
+
+    return {
+        "session_id": session_id,
+        "runtime_root": runtime_root,
+        "parent_pane": parent_pane,
+        "terminal": terminal,
+    }
+
+
+
+def cmd_add(args):
+    err, canonical_target = _validate_single_target_arg(getattr(args, "target", None), command="add")
+    if err is not None:
+        return err
+    assert canonical_target is not None
+
+    work_dir = Path.cwd()
+    try:
+        healthy, _message = target_cmd_utils.ping_target(work_dir, canonical_target)
+    except Exception:
+        healthy = False
+    if healthy:
+        print(f"ℹ️  {canonical_target} is already active")
+        return 0
+
+    live_response = request_control_plane_operation(work_dir, op="add", target=canonical_target)
+    if isinstance(live_response, dict):
+        message = str(live_response.get("message") or live_response.get("reply") or "").strip()
+        if message:
+            print(message)
+        return int(live_response.get("exit_code") or 0)
+
+    context = _load_active_target_context(work_dir)
+    if not context:
+        print("❌ No active CCB target context found for this project.", file=sys.stderr)
+        print("💡 Start at least one target with `ccb <target...>` before using `ccb add`.", file=sys.stderr)
+        return 2
+
+    launcher = AILauncher(targets=[canonical_target])
+    launcher.session_id = str(context["session_id"])
+    launcher.runtime_dir = Path(context["runtime_root"])
+    launcher.runtime_dir.mkdir(parents=True, exist_ok=True)
+    launcher.project_root = work_dir
+    launcher.project_id = compute_ccb_project_id(work_dir)
+    if context.get("terminal"):
+        launcher.terminal_type = str(context["terminal"])
+
+    pane_id = launcher._start_target(
+        canonical_target,
+        parent_pane=str(context.get("parent_pane") or "").strip() or None,
+        direction="bottom",
+    )
+    if not pane_id:
+        print(f"❌ failed to add {canonical_target}", file=sys.stderr)
+        return 1
+
+    print(f"✅ added {canonical_target}")
+    return 0
+
+
+
+def cmd_rm(args):
+    err, canonical_target = _validate_single_target_arg(getattr(args, "target", None), command="rm")
+    if err is not None:
+        return err
+    assert canonical_target is not None
+
+    work_dir = Path.cwd()
+    live_response = request_control_plane_operation(work_dir, op="rm", target=canonical_target)
+    if isinstance(live_response, dict):
+        message = str(live_response.get("message") or live_response.get("reply") or "").strip()
+        if message:
+            print(message)
+        return int(live_response.get("exit_code") or 0)
+
+    try:
+        project_id = compute_ccb_project_id(work_dir)
+    except Exception as exc:
+        print(f"❌ Failed to compute project ID: {exc}", file=sys.stderr)
+        return 2
+
+    killed_provider = _kill_target(work_dir, project_id, canonical_target)
+    try:
+        record_target_removal(work_dir, canonical_target)
+    except Exception:
+        pass
+    if killed_provider and not target_cmd_utils.resolve_provider_targets(work_dir, killed_provider):
+        _shutdown_provider_daemon(killed_provider)
+    return 0
+
+
+
 def cmd_kill(args):
     force = getattr(args, "force", False)
 
-    # Global zombie cleanup mode
     if force:
         yes = getattr(args, "yes", False)
         return _kill_global_zombies(yes=yes)
 
-    # Project-level cleanup (original behavior)
-    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "droid"], allow_unknown=True)
-    if not providers:
+    raw_targets = list(getattr(args, "targets", None) or getattr(args, "providers", None) or [])
+    provider = str(getattr(args, "provider", None) or "").strip().lower() or None
+
+    bare_tokens = [str(item).strip() for item in raw_targets if str(item).strip() and "@" not in str(item)]
+    if bare_tokens:
+        bad = bare_tokens[0]
+        print(f"❌ bare provider is not accepted here: {bad}", file=sys.stderr)
+        print(f"💡 use `ccb kill --provider {bad}` or `ccb kill {bad}@main`", file=sys.stderr)
         return 2
 
-    # Map provider names to their client specs to find daemon info
-    specs = {
-        "codex": CASK_CLIENT_SPEC,
-        "gemini": GASK_CLIENT_SPEC,
-        "opencode": OASK_CLIENT_SPEC,
-        "claude": LASK_CLIENT_SPEC,
-        "droid": DASK_CLIENT_SPEC,
-    }
+    try:
+        project_id = compute_ccb_project_id(Path.cwd())
+    except Exception as exc:
+        print(f"❌ Failed to compute project ID: {exc}", file=sys.stderr)
+        return 2
 
-    for provider in providers:
-        # 1. Kill UI sessions (tmux/wezterm)
-        session_file = find_project_session_file(Path.cwd(), f".{provider}-session")
-        if session_file and session_file.exists():
-            try:
-                data = json.loads(session_file.read_text(encoding="utf-8-sig"))
-                terminal = data.get("terminal", "tmux")
-                pane_id = data.get("pane_id") if terminal == "wezterm" else (data.get("pane_id") or data.get("tmux_session") or "")
+    targets = _resolve_kill_targets(project_id, targets=raw_targets, provider=provider)
+    if not targets:
+        print("ℹ️  No active targets found")
+        return 0
 
-                if terminal == "wezterm" and pane_id:
-                    backend = WeztermBackend()
-                    backend.kill_pane(pane_id)
-                elif pane_id and shutil.which("tmux"):
-                    backend = TmuxBackend()
-                    if str(pane_id).startswith("%"):
-                        backend.kill_pane(str(pane_id))
-                    else:
-                        tmux_session = str(data.get("tmux_session") or "").strip()
-                        if tmux_session and not tmux_session.startswith("%"):
-                            subprocess.run(["tmux", "kill-session", "-t", tmux_session], stderr=subprocess.DEVNULL)
-                            subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
-                        else:
-                            backend.kill_pane(str(pane_id))
+    scope = "provider" if provider else ("target" if raw_targets else "all")
+    killed_targets: list[str] = []
+    work_dir = Path.cwd()
+    for target in targets:
+        canonical_target = validate_target(target)
+        killed_provider = _kill_target(work_dir, project_id, canonical_target)
+        try:
+            record_target_removal(work_dir, canonical_target)
+        except Exception:
+            pass
+        if killed_provider:
+            killed_targets.append(canonical_target)
 
-                data["active"] = False
-                data["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
-                print(f"✅ {provider.capitalize()} session terminated")
-            except Exception as e:
-                print(f"❌ {provider}: {e}")
-        else:
-             print(f"ℹ️  {provider}: No active session file found")
-
-        # 2. Kill background daemon (graceful shutdown, then force kill)
-        spec = specs.get(provider)
-        if spec:
-            daemon_name = spec.daemon_bin_name
-            st_file = state_file_path(f"{daemon_name}.json")
-
-            try:
-                if shutdown_daemon(spec.protocol_prefix, 1.0, st_file):
-                    print(f"✅ {daemon_name} daemon shutdown requested")
-                else:
-                    # Graceful shutdown failed, try force kill using PID from state file
-                    st = read_state(st_file)
-                    if st and st.get("pid"):
-                        pid = int(st["pid"])
-                        if _kill_pid(pid, force=True):
-                            print(f"✅ {daemon_name} daemon force killed (pid={pid})")
-                        else:
-                            print(f"⚠️ {daemon_name} daemon could not be killed (pid={pid})")
-            except Exception:
-                pass
+    if scope != "target" and killed_targets:
+        for provider_name in _providers_requiring_shutdown_after_target_kill(project_id, killed_targets):
+            _shutdown_provider_daemon(provider_name)
 
     return 0
 
@@ -3837,12 +5082,12 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     Parse providers from argv.
 
     Accept both:
-      - space-separated: `ccb codex gemini opencode claude droid`
-      - comma-separated: `ccb codex,gemini,opencode,claude,droid`
+      - space-separated: `ccb codex gemini opencode claude droid cursor`
+      - comma-separated: `ccb codex,gemini,opencode,claude,droid,cursor`
 
     Returns a de-duplicated list preserving order.
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
+    allowed = {"codex", "gemini", "opencode", "claude", "droid", "cursor"}
     raw_parts = _split_provider_tokens(values)
 
     if not raw_parts:
@@ -3862,8 +5107,8 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     if unknown and not allow_unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude droid  (spaces)  or  ccb codex,gemini,opencode,claude,droid  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude droid cursor  (spaces)  or  ccb codex,gemini,opencode,claude,droid,cursor  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, droid, cursor", file=sys.stderr)
         return []
 
     return parsed
@@ -3874,7 +5119,7 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
     Parse providers from argv and treat "cmd" as a separate flag.
     Returns (providers, cmd_enabled).
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
+    allowed = {"codex", "gemini", "opencode", "claude", "droid", "cursor"}
     raw_parts = _split_provider_tokens(values)
     if not raw_parts:
         return [], False
@@ -3898,11 +5143,67 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
 
     if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude droid cmd  (spaces)  or  ccb codex,gemini,opencode,claude,droid,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid, cmd", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude droid cursor cmd  (spaces)  or  ccb codex,gemini,opencode,claude,droid,cursor,cmd  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, droid, cursor, cmd", file=sys.stderr)
         return [], cmd_enabled
 
     return parsed, cmd_enabled
+
+
+def _providers_from_targets(targets: list[str]) -> list[str]:
+    providers: list[str] = []
+    seen: set[str] = set()
+    for raw_target in targets:
+        provider = provider_of(raw_target)
+        if provider in seen:
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    return providers
+
+
+def _parse_targets(values: list[str]) -> list[str]:
+    raw_parts = _split_provider_tokens(values)
+    if not raw_parts:
+        return []
+
+    seen: set[str] = set()
+    parsed: list[str] = []
+    invalid: list[str] = []
+    for raw_target in raw_parts:
+        try:
+            target = validate_target(raw_target)
+        except ValueError:
+            invalid.append(raw_target)
+            continue
+        if target in seen:
+            continue
+        seen.add(target)
+        parsed.append(target)
+
+    if invalid:
+        print(f"❌ invalid target(s): {', '.join(invalid)}", file=sys.stderr)
+        print("💡 use: ccb codex@1 codex@2 claude@main cmd  (spaces)  or  ccb codex@1,codex@2,claude@main,cmd  (commas)", file=sys.stderr)
+        print("💡 every started backend target must include '@instance'", file=sys.stderr)
+        return []
+
+    return parsed
+
+
+def _parse_targets_with_cmd(values: list[str]) -> tuple[list[str], bool]:
+    raw_parts = _split_provider_tokens(values)
+    if not raw_parts:
+        return [], False
+
+    targets_only: list[str] = []
+    cmd_enabled = False
+    for raw_part in raw_parts:
+        if raw_part == "cmd":
+            cmd_enabled = True
+            continue
+        targets_only.append(raw_part)
+
+    return _parse_targets(targets_only), cmd_enabled
 
 
 def _get_version_info(dir_path: Path) -> dict:
@@ -4720,20 +6021,29 @@ def main():
 
     if argv and argv[0] == "up":
         print("❌ `ccb up` is no longer supported.", file=sys.stderr)
-        print("💡 Use: ccb [providers...]  (or configure ccb.config)", file=sys.stderr)
+        print("💡 Use: ccb [targets...]  (or configure ccb.config)", file=sys.stderr)
         return 2
 
     if argv and argv[0] == "droid" and len(argv) > 1 and argv[1] in {"setup-delegation", "test-delegation"}:
         return cmd_droid_subcommand(argv[1:])
 
-    if argv and argv[0] in {"kill", "update", "version", "uninstall", "reinstall"}:
+    if argv and argv[0] in {"kill", "ps", "add", "rm", "update", "version", "uninstall", "reinstall"}:
         parser = argparse.ArgumentParser(description="Claude AI unified launcher", add_help=True)
         subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
-        kill_parser = subparsers.add_parser("kill", help="Terminate session or clean up zombies")
-        kill_parser.add_argument("providers", nargs="*", default=[], help="Backends to terminate (codex/gemini/opencode/claude/droid)")
+        kill_parser = subparsers.add_parser("kill", help="Terminate targets or clean up zombies")
+        kill_parser.add_argument("targets", nargs="*", default=[], help="Targets to terminate (example: codex@1 claude@main)")
+        kill_parser.add_argument("--provider", default=None, help="Terminate all active targets for one provider")
         kill_parser.add_argument("-f", "--force", action="store_true", help="Clean up all zombie tmux sessions globally")
         kill_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt (with -f)")
+
+        subparsers.add_parser("ps", help="Show active targets in target-scoped view")
+
+        add_parser = subparsers.add_parser("add", help="Start one target instance in the current project")
+        add_parser.add_argument("target", help="Target to start (example: codex@2)")
+
+        rm_parser = subparsers.add_parser("rm", help="Terminate one target instance in the current project")
+        rm_parser.add_argument("target", help="Target to remove (example: codex@2)")
 
         update_parser = subparsers.add_parser("update", help="Update to latest or specified version")
         update_parser.add_argument("target", nargs="?",
@@ -4746,6 +6056,12 @@ def main():
         args = parser.parse_args(argv)
         if args.command == "kill":
             return cmd_kill(args)
+        if args.command == "ps":
+            return cmd_ps(args)
+        if args.command == "add":
+            return cmd_add(args)
+        if args.command == "rm":
+            return cmd_rm(args)
         if args.command == "update":
             return cmd_update(args)
         if args.command == "version":
@@ -4764,12 +6080,12 @@ def main():
     start_parser = argparse.ArgumentParser(
         description="Claude AI unified launcher",
         add_help=True,
-        epilog="Other commands: ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
+        epilog="Other commands: ccb ps | ccb add <target> | ccb rm <target> | ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
     )
     start_parser.add_argument(
         "providers",
         nargs="*",
-        help="Backends to start (space or comma separated): codex, gemini, opencode, claude, droid (add cmd for a shell pane)",
+        help="Targets to start (space or comma separated): codex@1 codex@2 claude@main (add cmd for a shell pane)",
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")

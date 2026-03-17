@@ -13,7 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from session_store import load_target_session, session_path_for_target
 from session_utils import find_project_session_file, legacy_project_config_dir, project_config_dir, resolve_project_config_dir
+from target_id import instance_of, provider_of, to_fs_safe_slug, validate_target
 from .types import ConversationEntry, TransferContext, SessionNotFoundError, SessionStats
 from .session_parser import ClaudeSessionParser
 from .deduper import ConversationDeduper
@@ -50,7 +52,25 @@ class ContextTransfer:
         value = (provider or "auto").strip().lower()
         return value or "auto"
 
-    def _load_session_data(self, provider: str) -> tuple[Optional[Path], dict]:
+    def _load_session_data(self, provider: str, source_target: Optional[str] = None) -> tuple[Optional[Path], dict]:
+        canonical_target = None
+        if source_target:
+            try:
+                canonical_target = validate_target(source_target)
+            except ValueError:
+                canonical_target = None
+        if canonical_target:
+            try:
+                if provider_of(canonical_target) == provider:
+                    data = load_target_session(self.work_dir, canonical_target)
+                    if isinstance(data, dict) and data:
+                        data.setdefault("target", canonical_target)
+                        return session_path_for_target(self.work_dir, canonical_target), data
+                    if instance_of(canonical_target) != "main":
+                        return None, {}
+            except Exception:
+                pass
+
         filename = self.SOURCE_SESSION_FILES.get(provider)
         if not filename:
             return None, {}
@@ -64,6 +84,8 @@ class ContextTransfer:
                 data = {}
         except Exception:
             data = {}
+        if canonical_target and isinstance(data, dict) and data:
+            data.setdefault("target", canonical_target)
         return session_file, data
 
     def _auto_source_candidates(self) -> list[str]:
@@ -96,6 +118,7 @@ class ContextTransfer:
         provider: str,
         session_id: str,
         session_path: Optional[Path] = None,
+        source_target: Optional[str] = None,
         last_n: int = 3,
         stats: Optional[SessionStats] = None,
     ) -> TransferContext:
@@ -122,6 +145,8 @@ class ContextTransfer:
         metadata = {"provider": provider}
         if session_path:
             metadata["session_path"] = str(session_path)
+        if source_target:
+            metadata["target"] = source_target
 
         return TransferContext(
             conversations=cleaned_pairs,
@@ -138,11 +163,17 @@ class ContextTransfer:
         last_n: int = 3,
         include_stats: bool = True,
         source_provider: str = "auto",
+        source_target: Optional[str] = None,
         source_session_id: Optional[str] = None,
         source_project_id: Optional[str] = None,
     ) -> TransferContext:
         """Extract and process conversations from a session."""
         provider = self._normalize_provider(source_provider)
+        if provider == "auto" and source_target:
+            try:
+                provider = provider_of(validate_target(source_target))
+            except ValueError:
+                provider = "auto"
         if provider == "auto":
             if session_path:
                 return self._extract_from_claude(
@@ -158,6 +189,7 @@ class ContextTransfer:
                         session_path=session_path,
                         last_n=last_n,
                         include_stats=include_stats,
+                        source_target=source_target,
                         source_session_id=source_session_id,
                         source_project_id=source_project_id,
                     )
@@ -173,6 +205,7 @@ class ContextTransfer:
             session_path=session_path,
             last_n=last_n,
             include_stats=include_stats,
+            source_target=source_target,
             source_session_id=source_session_id,
             source_project_id=source_project_id,
         )
@@ -218,6 +251,7 @@ class ContextTransfer:
         session_path: Optional[Path],
         last_n: int,
         include_stats: bool,
+        source_target: Optional[str],
         source_session_id: Optional[str],
         source_project_id: Optional[str],
     ) -> TransferContext:
@@ -232,24 +266,28 @@ class ContextTransfer:
                 last_n=last_n,
                 session_path=session_path,
                 session_id=source_session_id,
+                source_target=source_target,
             )
         if provider == "gemini":
             return self._extract_from_gemini(
                 last_n=last_n,
                 session_path=session_path,
                 session_id=source_session_id,
+                source_target=source_target,
             )
         if provider == "opencode":
             return self._extract_from_opencode(
                 last_n=last_n,
                 session_id=source_session_id,
                 project_id=source_project_id,
+                source_target=source_target,
             )
         if provider == "droid":
             return self._extract_from_droid(
                 last_n=last_n,
                 session_path=session_path,
                 session_id=source_session_id,
+                source_target=source_target,
             )
         raise SessionNotFoundError(f"Unsupported source provider: {provider}")
 
@@ -297,8 +335,9 @@ class ContextTransfer:
         last_n: int,
         session_path: Optional[Path] = None,
         session_id: Optional[str] = None,
+        source_target: Optional[str] = None,
     ) -> TransferContext:
-        session_file, data = self._load_session_data("codex")
+        session_file, data = self._load_session_data("codex", source_target)
         # Only use current active session, not old_* fallback to prevent "amnesia"
         log_path = session_path or (
             data.get("codex_session_path")
@@ -341,6 +380,7 @@ class ContextTransfer:
             provider="codex",
             session_id=session_id,
             session_path=session_path,
+            source_target=source_target,
             last_n=last_n,
         )
 
@@ -350,8 +390,9 @@ class ContextTransfer:
         last_n: int,
         session_path: Optional[Path] = None,
         session_id: Optional[str] = None,
+        source_target: Optional[str] = None,
     ) -> TransferContext:
-        session_file, data = self._load_session_data("gemini")
+        session_file, data = self._load_session_data("gemini", source_target)
         # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("gemini_session_id")
@@ -389,6 +430,7 @@ class ContextTransfer:
             provider="gemini",
             session_id=session_id,
             session_path=session_path,
+            source_target=source_target,
             last_n=last_n,
         )
 
@@ -398,8 +440,9 @@ class ContextTransfer:
         last_n: int,
         session_path: Optional[Path] = None,
         session_id: Optional[str] = None,
+        source_target: Optional[str] = None,
     ) -> TransferContext:
-        session_file, data = self._load_session_data("droid")
+        session_file, data = self._load_session_data("droid", source_target)
         # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("droid_session_id")
@@ -439,6 +482,7 @@ class ContextTransfer:
             provider="droid",
             session_id=session_id,
             session_path=session_path,
+            source_target=source_target,
             last_n=last_n,
         )
 
@@ -448,8 +492,9 @@ class ContextTransfer:
         last_n: int,
         session_id: Optional[str] = None,
         project_id: Optional[str] = None,
+        source_target: Optional[str] = None,
     ) -> TransferContext:
-        session_file, data = self._load_session_data("opencode")
+        session_file, data = self._load_session_data("opencode", source_target)
         # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("opencode_session_id")
@@ -497,6 +542,7 @@ class ContextTransfer:
             provider="opencode",
             session_id=session_id or "unknown",
             session_path=session_path_obj,
+            source_target=source_target,
             last_n=last_n,
         )
 
@@ -569,7 +615,13 @@ class ContextTransfer:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             session_short = context.source_session_id[:8]
             source_provider = (context.source_provider or context.metadata.get("provider") or "session").strip().lower()
-            if not source_provider:
+            source_target = str(context.metadata.get("target") or "").strip()
+            if source_target:
+                try:
+                    source_provider = to_fs_safe_slug(source_target)
+                except ValueError:
+                    source_provider = source_target.replace("@", "--")
+            elif not source_provider:
                 source_provider = "session"
             source_provider = source_provider.replace("/", "-").replace("\\", "-")
             provider_suffix = f"-to-{target_provider}" if target_provider else ""

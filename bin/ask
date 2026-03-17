@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, droid, claude
+    gemini, codex, opencode, droid, claude, cursor
 
 Modes:
     Default (async):  Background task with hook callback
@@ -44,6 +44,7 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
+from target_id import instance_of, provider_of, validate_target
 
 
 # Provider to daemon command mapping
@@ -53,6 +54,7 @@ PROVIDER_DAEMONS = {
     "opencode": "oask",
     "droid": "dask",
     "claude": "lask",
+    "cursor": "uask",
 }
 
 
@@ -162,6 +164,7 @@ def _send_via_unified_daemon(
     timeout: float,
     no_wrap: bool,
     caller: str,
+    target: str | None = None,
 ) -> int:
     """Send request via unified askd daemon with auto-start retry."""
     import json
@@ -211,6 +214,15 @@ def _send_via_unified_daemon(
         "no_wrap": no_wrap,
         "caller": caller,
     }
+    if target:
+        canonical_target = validate_target(target)
+        req["target"] = canonical_target
+        req["instance"] = instance_of(canonical_target)
+    caller_target = (os.environ.get("CCB_CALLER_TARGET") or "").strip()
+    if not caller_target:
+        caller_target = (os.environ.get("CCB_SELF_TARGET") or "").strip()
+    if caller_target:
+        req["caller_target"] = caller_target
 
     # Pass email-related env vars for email caller
     if caller == "email":
@@ -310,10 +322,40 @@ def _default_foreground() -> bool:
 
 def _require_caller() -> str:
     caller = (os.environ.get("CCB_CALLER") or "").strip()
-    if caller:
-        return caller
-    print("[ERROR] CCB_CALLER is required. Set CCB_CALLER=<provider> (e.g. CCB_CALLER=claude).", file=sys.stderr)
-    sys.exit(1)
+    if not caller:
+        print("[ERROR] CCB_CALLER is required. Set CCB_CALLER=<provider> (e.g. CCB_CALLER=claude).", file=sys.stderr)
+        sys.exit(1)
+    if (
+        os.environ.get("CCB_IS_ANCHOR") == "1"
+        and caller not in ("cursor-ide", "anchor", "email")
+        and os.environ.get("CCB_ANCHOR_NOTIFY", "").strip().lower() not in ("1", "true", "yes", "on")
+    ):
+        return "anchor"
+    return caller
+
+
+def _normalize_provider_and_target(value: str) -> tuple[str, str | None]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "", None
+    if "@" not in raw:
+        return raw, None
+    canonical_target = validate_target(raw)
+    return provider_of(canonical_target), canonical_target
+
+
+def _env_target_for_provider(provider: str) -> str | None:
+    for env_name in ("CCB_TARGET", "CCB_CALLER_TARGET"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            canonical_target = validate_target(raw)
+        except ValueError:
+            continue
+        if provider_of(canonical_target) == provider:
+            return canonical_target
+    return None
 
 
 def make_task_id() -> str:
@@ -324,10 +366,10 @@ def make_task_id() -> str:
 
 
 def _usage() -> None:
-    print("Usage: ask <provider> [options] <message>", file=sys.stderr)
+    print("Usage: ask <provider|provider@instance> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, cursor", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
@@ -343,8 +385,13 @@ def main(argv: list[str]) -> int:
         _usage()
         return EXIT_ERROR
 
-    # First argument must be the provider
-    provider = argv[1].lower()
+    # First argument may be a provider or provider@instance target
+    raw_provider = str(argv[1] or "").strip()
+    try:
+        provider, explicit_target = _normalize_provider_and_target(raw_provider)
+    except ValueError:
+        print(f"[ERROR] Invalid target: {raw_provider}", file=sys.stderr)
+        return EXIT_ERROR
 
     if provider in ("-h", "--help"):
         _usage()
@@ -356,6 +403,7 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     daemon_cmd = PROVIDER_DAEMONS[provider]
+    resolved_target = explicit_target or _env_target_for_provider(provider)
 
     # Parse remaining arguments
     timeout: float = 3600.0
@@ -411,6 +459,8 @@ def main(argv: list[str]) -> int:
 
         # Legacy daemon path for notify mode
         cmd = [daemon_cmd, "--sync"]
+        if resolved_target:
+            cmd.extend(["--target", resolved_target])
         if no_wrap:
             cmd.append("--no-wrap")
         try:
@@ -430,21 +480,35 @@ def main(argv: list[str]) -> int:
 
     # Foreground mode: run provider directly via unified daemon
     if foreground_mode:
+        caller = _require_caller()
         if _use_unified_daemon():
-            caller = _require_caller()
-            return _send_via_unified_daemon(provider, message, timeout, no_wrap, caller)
-        else:
-            cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
-            if no_wrap and provider == "claude":
-                cmd.append("--no-wrap")
-            env = os.environ.copy()
-            env["CCB_CALLER"] = _require_caller()
-            try:
-                result = subprocess.run(cmd, input=message, text=True, env=env)
-                return result.returncode
-            except Exception as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
-                return EXIT_ERROR
+            rc = _send_via_unified_daemon(provider, message, timeout, no_wrap, caller, target=resolved_target)
+            if rc == EXIT_OK:
+                return EXIT_OK
+            # Unified daemon failed; fall through to legacy provider daemon
+            print(f"[WARN] Unified daemon failed (exit={rc}) for {provider}, trying legacy path", file=sys.stderr)
+
+        cmd = [daemon_cmd, "--sync", "--timeout", str(timeout)]
+        if resolved_target:
+            cmd.extend(["--target", resolved_target])
+        if no_wrap and provider in ("claude", "cursor"):
+            cmd.append("--no-wrap")
+        env = os.environ.copy()
+        env["CCB_CALLER"] = caller
+        self_target = (os.environ.get("CCB_SELF_TARGET") or "").strip()
+        if self_target and not os.environ.get("CCB_CALLER_TARGET"):
+            env["CCB_CALLER_TARGET"] = self_target
+        # Disable provider-specific daemon so the legacy command
+        # falls through directly to tmux injection (avoids re-hitting
+        # the same unified daemon that just failed).
+        # Env var follows daemon_cmd: cask→CCB_CASKD, uask→CCB_UASKD, etc.
+        env[f"CCB_{daemon_cmd.upper()}D"] = "0"
+        try:
+            result = subprocess.run(cmd, input=message, text=True, env=env)
+            return result.returncode
+        except Exception as e:
+            print(f"[ERROR] {e}", file=sys.stderr)
+            return EXIT_ERROR
 
     # Default async mode: background task via nohup
     task_id = make_task_id()
@@ -462,6 +526,7 @@ def main(argv: list[str]) -> int:
 
     # Get the path to this script for recursive call with --foreground
     ask_cmd = str(Path(__file__).resolve())
+    route_token = resolved_target or provider
 
     # Platform-specific background execution
     if os.name == "nt":
@@ -481,7 +546,7 @@ def main(argv: list[str]) -> int:
 $env:CCB_REQ_ID = "{task_id}"
 $env:CCB_CALLER = "{caller}"
 $env:CCB_WORK_DIR = "{os.getcwd()}"
-Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}
+Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" "{route_token}" --foreground --timeout {timeout}
 '''
         script_file.write_text(script_content, encoding="utf-8")
 
@@ -510,7 +575,7 @@ Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --
 export CCB_REQ_ID="{task_id}"
 export CCB_CALLER="{caller}"
 export CCB_WORK_DIR="{os.getcwd()}"
-{run_dir_line}{email_env_lines}python3 "{ask_cmd}" {provider} --foreground --timeout {timeout} <<'ASKEOF'
+{run_dir_line}{email_env_lines}python3 "{ask_cmd}" "{route_token}" --foreground --timeout {timeout} <<'ASKEOF'
 {message}
 ASKEOF
 '''

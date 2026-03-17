@@ -16,11 +16,15 @@ from providers import ProviderDaemonSpec
 class ProviderRequest:
     """Unified request structure for all providers."""
     client_id: str
+    provider: str
     work_dir: str
     timeout_s: float
     quiet: bool
     message: str
     caller: str
+    target: Optional[str] = None
+    instance: Optional[str] = None
+    caller_target: Optional[str] = None
     output_path: Optional[str] = None
     req_id: Optional[str] = None
     no_wrap: bool = False
@@ -63,6 +67,7 @@ class QueuedTask:
     result: Optional[ProviderResult] = None
     cancelled: bool = False  # Cancellation flag for timeout/expiry
     cancel_event: Optional[threading.Event] = None  # Event for cooperative cancellation
+    started_event: Optional[threading.Event] = None  # Set when worker begins processing
 
 
 class BaseProviderAdapter(ABC):
@@ -92,12 +97,12 @@ class BaseProviderAdapter(ABC):
         ...
 
     @abstractmethod
-    def load_session(self, work_dir: Path) -> Optional[Any]:
-        """Load session for the given work directory."""
+    def load_session(self, work_dir: Path, target: str | None = None) -> Optional[Any]:
+        """Load session for the given work directory and target."""
         ...
 
     @abstractmethod
-    def compute_session_key(self, session: Any) -> str:
+    def compute_session_key(self, session: Any, target: str | None = None) -> str:
         """Compute a unique session key for routing."""
         ...
 

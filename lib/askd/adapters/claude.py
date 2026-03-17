@@ -480,11 +480,11 @@ class ClaudeAdapter(BaseProviderAdapter):
         except Exception:
             pass
 
-    def load_session(self, work_dir: Path) -> Optional[Any]:
-        return load_project_session(work_dir)
+    def load_session(self, work_dir: Path, target: str | None = None) -> Optional[Any]:
+        return load_project_session(work_dir, target)
 
-    def compute_session_key(self, session: Any) -> str:
-        return compute_session_key(session) if session else "claude:unknown"
+    def compute_session_key(self, session: Any, target: str | None = None) -> str:
+        return compute_session_key(session, target) if session else "claude:unknown"
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
@@ -492,8 +492,8 @@ class ClaudeAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=claude req_id={task.req_id} work_dir={req.work_dir}")
 
-        session = load_project_session(work_dir)
-        session_key = self.compute_session_key(session)
+        session = load_project_session(work_dir, req.target)
+        session_key = self.compute_session_key(session, req.target)
 
         if not session:
             return ProviderResult(
@@ -565,6 +565,8 @@ class ClaudeAdapter(BaseProviderAdapter):
             req_id=result.req_id,
             done_seen=result.done_seen,
             caller=req.caller,
+            target=req.target,
+            caller_target=req.caller_target,
             email_req_id=req.email_req_id,
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,

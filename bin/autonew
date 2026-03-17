@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-autonew - Send /new command to a provider's terminal pane to start a new session.
+autonew - Send /new command to provider terminal panes.
 
 Usage:
-    autonew <provider>
+    autonew [target] [--provider PROVIDER]
 
-Providers:
-    gemini, codex, opencode, droid, claude
-
-This command directly sends '/new' to the provider's terminal pane
-without any context injection or protocol wrapping.
+Scopes:
+    autonew codex@2
+    autonew --provider codex
+    autonew
+    autonew codex            # legacy bare-provider compatibility
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -23,93 +24,190 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from cli_output import EXIT_ERROR, EXIT_OK
-from pane_registry import load_registry_by_project_id, _get_providers_map
+from pane_registry import _get_providers_map, load_registry_by_project_id
 from project_id import compute_ccb_project_id
+from target_id import provider_of, validate_target
 from terminal import get_backend_for_session
+import target_command_utils as target_cmd_utils
 
 
-# Provider to reset command mapping
 PROVIDER_COMMANDS = {
     "gemini": "/clear",
     "codex": "/new",
     "opencode": "/new",
     "droid": "/new",
     "claude": "/new",
+    "cursor": "/clear",
 }
 
 
 def _usage() -> None:
-    print("Usage: autonew <provider>", file=sys.stderr)
+    print("Usage: autonew [target] [--provider PROVIDER]", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Scopes:", file=sys.stderr)
+    print("  autonew codex@2", file=sys.stderr)
+    print("  autonew --provider codex", file=sys.stderr)
+    print("  autonew", file=sys.stderr)
+    print("  autonew codex            # legacy bare-provider compatibility", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("Sends /new to the provider's pane to start a new session.", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, cursor", file=sys.stderr)
+
+
+def _resolve_target_entry(work_dir: Path, target: str) -> tuple[dict | None, dict | None]:
+    return target_cmd_utils.resolve_target_entry(work_dir, target)
+
+
+def _resolve_provider_targets(work_dir: Path, provider: str) -> list[str]:
+    return target_cmd_utils.resolve_provider_targets(work_dir, provider)
+
+
+def _resolve_scope_targets(work_dir: Path, target: str | None = None, provider: str | None = None) -> list[str]:
+    positional = [target] if target else []
+    targets, _scope = target_cmd_utils.resolve_scope_targets_for_command(work_dir, positional=positional, provider=provider)
+    return targets
+
+
+def _resolve_pane_id(record: dict, entry: dict, backend) -> str:
+    pane_id = str(entry.get("pane_id") or record.get("pane_id") or "").strip()
+    marker = str(entry.get("pane_title_marker") or record.get("pane_title_marker") or "").strip()
+    if not pane_id and marker:
+        resolver = getattr(backend, "find_pane_by_title_marker", None)
+        if callable(resolver):
+            try:
+                pane_id = str(resolver(marker) or "").strip()
+            except Exception:
+                pane_id = ""
+    return pane_id
+
+
+def _send_reset_to_target(work_dir: Path, target: str) -> tuple[bool, str]:
+    canonical_target = validate_target(target)
+    provider = provider_of(canonical_target)
+    reset_cmd = PROVIDER_COMMANDS[provider]
+
+    record, entry = _resolve_target_entry(work_dir, canonical_target)
+    if not record or not entry:
+        return False, f"[ERROR] No active {canonical_target} session found for this project."
+
+    backend = get_backend_for_session(record)
+    if not backend:
+        return False, "[ERROR] Terminal backend not available."
+
+    pane_id = _resolve_pane_id(record, entry, backend)
+    if not pane_id:
+        return False, f"[ERROR] No pane_id found for {canonical_target}."
+
+    try:
+        if not backend.is_alive(pane_id):
+            return False, f"[ERROR] {canonical_target} pane {pane_id} is not alive."
+    except Exception as exc:
+        return False, f"[ERROR] Failed to check pane status: {exc}"
+
+    try:
+        backend.send_text(pane_id, reset_cmd)
+        return True, f"Sent {reset_cmd} to {canonical_target} (pane: {pane_id})"
+    except Exception as exc:
+        return False, f"[ERROR] Failed to send {reset_cmd}: {exc}"
+
+
+def _send_reset_to_legacy_provider(work_dir: Path, provider: str) -> tuple[bool, str]:
+    provider_name = str(provider or "").strip().lower()
+    targets = _resolve_provider_targets(work_dir, provider_name)
+    if len(targets) == 1:
+        return _send_reset_to_target(work_dir, targets[0])
+
+    try:
+        project_id = compute_ccb_project_id(work_dir)
+    except Exception as exc:
+        return False, f"[ERROR] Failed to compute project ID: {exc}"
+
+    record = load_registry_by_project_id(project_id, provider_name)
+    if not record:
+        if targets:
+            joined = ", ".join(targets)
+            return False, f"[ERROR] Ambiguous provider {provider_name}; use one of: {joined}"
+        return False, f"[ERROR] No active {provider_name} session found for this project."
+
+    providers_map = _get_providers_map(record)
+    provider_entry = providers_map.get(provider_name, {})
+    if not provider_entry:
+        if targets:
+            joined = ", ".join(targets)
+            return False, f"[ERROR] Ambiguous provider {provider_name}; use one of: {joined}"
+        return False, f"[ERROR] No pane entry found for {provider_name}."
+
+    backend = get_backend_for_session(record)
+    if not backend:
+        return False, "[ERROR] Terminal backend not available."
+
+    pane_id = _resolve_pane_id(record, provider_entry, backend)
+    if not pane_id:
+        return False, f"[ERROR] No pane_id found for {provider_name}."
+
+    try:
+        if not backend.is_alive(pane_id):
+            return False, f"[ERROR] {provider_name} pane {pane_id} is not alive."
+    except Exception as exc:
+        return False, f"[ERROR] Failed to check pane status: {exc}"
+
+    try:
+        reset_cmd = PROVIDER_COMMANDS[provider_name]
+        backend.send_text(pane_id, reset_cmd)
+        return True, f"Sent {reset_cmd} to {provider_name} (pane: {pane_id})"
+    except Exception as exc:
+        return False, f"[ERROR] Failed to send {PROVIDER_COMMANDS[provider_name]}: {exc}"
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) <= 1:
-        _usage()
-        return EXIT_ERROR
+    parser = argparse.ArgumentParser(prog="autonew", add_help=False)
+    parser.add_argument("scope", nargs="?")
+    parser.add_argument("--provider", dest="provider", default=None)
+    parser.add_argument("-h", "--help", action="store_true")
+    args, _unknown = parser.parse_known_args(argv[1:])
 
-    provider = argv[1].lower()
-
-    if provider in ("-h", "--help"):
+    if args.help:
         _usage()
         return EXIT_OK
 
-    if provider not in PROVIDER_COMMANDS:
+    scope = str(args.scope or "").strip().lower()
+    provider = str(args.provider or "").strip().lower() or None
+
+    if provider and provider not in PROVIDER_COMMANDS:
         print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(sorted(PROVIDER_COMMANDS.keys()))}", file=sys.stderr)
         return EXIT_ERROR
 
-    # Get current project ID
-    work_dir = Path(os.getcwd())
-    try:
-        project_id = compute_ccb_project_id(work_dir)
-    except Exception as e:
-        print(f"[ERROR] Failed to compute project ID: {e}", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Load registry for this project and provider
-    record = load_registry_by_project_id(project_id, provider)
-    if not record:
-        print(f"[ERROR] No active {provider} session found for this project.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Get provider's pane_id
-    providers_map = _get_providers_map(record)
-    provider_entry = providers_map.get(provider, {})
-    pane_id = str(provider_entry.get("pane_id") or "").strip()
-
-    if not pane_id:
-        print(f"[ERROR] No pane_id found for {provider}.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Get terminal backend
-    backend = get_backend_for_session(record)
-    if not backend:
-        print("[ERROR] Terminal backend not available.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Check if pane is alive
-    try:
-        if not backend.is_alive(pane_id):
-            print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+    if scope and "@" not in scope and not provider:
+        if scope not in PROVIDER_COMMANDS:
+            print(f"[ERROR] Unknown provider: {scope}", file=sys.stderr)
+            print(f"[ERROR] Available: {', '.join(sorted(PROVIDER_COMMANDS.keys()))}", file=sys.stderr)
             return EXIT_ERROR
-    except Exception as e:
-        print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
+        ok, message = _send_reset_to_legacy_provider(Path(os.getcwd()), scope)
+        stream = sys.stdout if ok else sys.stderr
+        print(message, file=stream)
+        return EXIT_OK if ok else EXIT_ERROR
+
+    if scope and provider:
+        print("[ERROR] target and --provider cannot be used together", file=sys.stderr)
         return EXIT_ERROR
 
-    # Send reset command to the pane
-    reset_cmd = PROVIDER_COMMANDS[provider]
-    try:
-        backend.send_text(pane_id, reset_cmd)
-        print(f"Sent {reset_cmd} to {provider} (pane: {pane_id})")
-        return EXIT_OK
-    except Exception as e:
-        print(f"[ERROR] Failed to send {reset_cmd}: {e}", file=sys.stderr)
+    work_dir = Path(os.getcwd())
+    target = scope if "@" in scope else None
+    targets = _resolve_scope_targets(work_dir, target=target, provider=provider)
+    if not targets:
+        print("[ERROR] No active targets found for this project.", file=sys.stderr)
         return EXIT_ERROR
+
+    failures: list[str] = []
+    for target_name in targets:
+        ok, message = _send_reset_to_target(work_dir, target_name)
+        stream = sys.stdout if ok else sys.stderr
+        print(message, file=stream)
+        if not ok:
+            failures.append(target_name)
+
+    return EXIT_OK if not failures else EXIT_ERROR
 
 
 if __name__ == "__main__":

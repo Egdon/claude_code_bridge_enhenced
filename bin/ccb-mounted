@@ -1,112 +1,190 @@
-#!/usr/bin/env bash
-# ccb-mounted - Check which CCB providers are mounted
-# Usage: ccb-mounted [--json|--simple] [--autostart] [path]
+#!/usr/bin/env python3
+"""
+ccb-mounted - Check which CCB targets are mounted.
 
-set -euo pipefail
+Usage:
+    ccb-mounted [--json|--simple] [--autostart] [path]
+"""
 
-PROVIDERS="codex:cask gemini:gask opencode:oask claude:lask droid:dask"
-CWD=$(pwd)
-FORMAT="--json"
-AUTOSTART=false
+from __future__ import annotations
 
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
 
-# Argument parsing
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --simple)
-      FORMAT="--simple"
-      shift
-      ;;
-    --json)
-      FORMAT="--json"
-      shift
-      ;;
-    --autostart)
-      AUTOSTART=true
-      shift
-      ;;
-    -*)
-      echo "Unknown option: $1" >&2
-      exit 1
-      ;;
-    *)
-      CWD="$1"
-      shift
-      ;;
-  esac
-done
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
 
-# Normalize CWD for Windows (convert /e/... to E:/...)
-if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
-  # Convert msys path /e/foo to E:/foo
-  if [[ "$CWD" =~ ^/([a-zA-Z])/ ]]; then
-    CWD="${BASH_REMATCH[1]^}:${CWD:2}"
-  fi
-fi
+from askd_client import maybe_start_daemon, state_file_from_env, wait_for_daemon_ready
+from compat import setup_windows_encoding
+from pane_registry import (
+    _coerce_updated_at,
+    _is_stale,
+    _iter_registry_files,
+    _load_registry_file,
+    get_instances_map,
+)
+from project_id import compute_ccb_project_id
+from providers import (
+    CASK_CLIENT_SPEC,
+    DASK_CLIENT_SPEC,
+    GASK_CLIENT_SPEC,
+    LASK_CLIENT_SPEC,
+    OASK_CLIENT_SPEC,
+    UASK_CLIENT_SPEC,
+)
+from target_id import instance_of, provider_of
+import target_command_utils as target_cmd_utils
 
-# Detect OS and get online daemons accordingly
-if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "${WINDIR:-}" ]]; then
-  # Windows: use ping command to check each provider directly
-  MOUNTED=""
-  for pair in $PROVIDERS; do
-    provider="${pair%%:*}"
-    # Check session file exists first
-    if [[ -f "$CWD/.ccb/.${provider}-session" ]] || [[ -f "$CWD/.ccb_config/.${provider}-session" ]] || [[ -f "$CWD/.${provider}-session" ]]; then
-      # Try the ping command to check if daemon is responsive
-      PING_ARGS=("$provider")
-      if [[ "$AUTOSTART" == true ]]; then
-        PING_ARGS+=("--autostart")
-      fi
-      if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "${PING_ARGS[@]}") >/dev/null 2>&1; then
-        MOUNTED="$MOUNTED $provider"
-      fi
-    fi
-  done
-else
-  # Linux/macOS: use pgrep
-  ONLINE=$(pgrep -af "bin/[cglod]askd$" 2>/dev/null | grep -oE "[cglod]askd" | sort -u || true)
+setup_windows_encoding()
 
-  MOUNTED=""
-  for pair in $PROVIDERS; do
-    provider="${pair%%:*}"
-    daemon="${pair##*:}"
+_MSYS_DRIVE_RE = re.compile(r"^/([a-zA-Z])/(.*)$")
 
-    # Check session file exists
-    if [[ -f "$CWD/.ccb/.${provider}-session" ]] || [[ -f "$CWD/.ccb_config/.${provider}-session" ]] || [[ -f "$CWD/.${provider}-session" ]]; then
-      # Check daemon is online
-      IS_ONLINE=false
-      if echo "$ONLINE" | grep -q "${daemon}d"; then
-        IS_ONLINE=true
-      fi
+SPEC_BY_PROVIDER = {
+    "codex": CASK_CLIENT_SPEC,
+    "gemini": GASK_CLIENT_SPEC,
+    "opencode": OASK_CLIENT_SPEC,
+    "claude": LASK_CLIENT_SPEC,
+    "droid": DASK_CLIENT_SPEC,
+    "cursor": UASK_CLIENT_SPEC,
+}
+KNOWN_PROVIDERS = tuple(SPEC_BY_PROVIDER)
 
-      if [[ "$IS_ONLINE" == false ]] && [[ "$AUTOSTART" == true ]]; then
-        # Try to autostart if requested and not online
-        if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "$provider" --autostart) >/dev/null 2>&1; then
-           IS_ONLINE=true
-        fi
-      fi
 
-      if [[ "$IS_ONLINE" == true ]]; then
-        MOUNTED="$MOUNTED $provider"
-      fi
-    fi
-  done
-fi
+def _normalize_work_dir_arg(raw: str | None) -> Path:
+    candidate = str(raw or os.getcwd()).strip() or os.getcwd()
+    ostype = os.environ.get("OSTYPE", "")
+    if os.name == "nt" or ostype.startswith("msys") or ostype.startswith("cygwin"):
+        match = _MSYS_DRIVE_RE.match(candidate)
+        if match:
+            candidate = f"{match.group(1).upper()}:/{match.group(2)}"
+    try:
+        return Path(candidate).expanduser().resolve()
+    except Exception:
+        return Path(candidate).expanduser().absolute()
 
-MOUNTED=$(echo $MOUNTED | xargs)  # trim
 
-case "$FORMAT" in
-  --simple)
-    echo "$MOUNTED"
-    ;;
-  --json|*)
-    if [[ -z "$MOUNTED" ]]; then
-      echo "{\"cwd\":\"$CWD\",\"mounted\":[]}"
-    else
-      JSON_ARRAY=$(echo "$MOUNTED" | sed 's/ /","/g;s/^/"/;s/$/"/')
-      echo "{\"cwd\":\"$CWD\",\"mounted\":[$JSON_ARRAY]}"
-    fi
-    ;;
-esac
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _target_sort_key(target: str) -> tuple[str, int, str]:
+    provider = provider_of(target)
+    instance = instance_of(target)
+    return provider, 0 if instance == "main" else 1, instance
+
+
+def _targets_from_sessions(work_dir: Path) -> list[str]:
+    targets, _scope = target_cmd_utils.resolve_scope_targets_for_command(work_dir)
+    return targets
+
+
+def _targets_from_registry(work_dir: Path) -> list[str]:
+    try:
+        project_id = compute_ccb_project_id(work_dir)
+    except Exception:
+        return []
+
+    targets: list[str] = []
+    for path in _iter_registry_files():
+        record = _load_registry_file(path)
+        if not isinstance(record, dict):
+            continue
+        updated_at = _coerce_updated_at(record.get("updated_at"), path)
+        if _is_stale(updated_at):
+            continue
+        if str(record.get("ccb_project_id") or "").strip() != project_id:
+            continue
+        targets.extend(get_instances_map(record).keys())
+    return _dedupe_keep_order(targets)
+
+
+def _resolve_candidate_targets(work_dir: Path) -> list[str]:
+    return _dedupe_keep_order(_targets_from_sessions(work_dir) + _targets_from_registry(work_dir))
+
+
+def _resolve_project_targets(work_dir: Path) -> list[str]:
+    return _resolve_candidate_targets(work_dir)
+
+
+def _maybe_autostart_for_targets(work_dir: Path, targets: list[str]) -> None:
+    attempted_providers: set[str] = set()
+    for target in targets:
+        provider = provider_of(target)
+        if provider in attempted_providers:
+            continue
+        attempted_providers.add(provider)
+
+        spec = SPEC_BY_PROVIDER.get(provider)
+        if spec is None:
+            continue
+
+        state_file = state_file_from_env(spec.state_file_env)
+        if wait_for_daemon_ready(spec, timeout_s=0.2, state_file=state_file):
+            continue
+        if maybe_start_daemon(spec, work_dir, target=target):
+            wait_for_daemon_ready(spec, timeout_s=1.5, state_file=state_file)
+
+
+def _probe_target(work_dir: Path, target: str, autostart: bool = False) -> tuple[bool, str]:
+    if autostart:
+        _maybe_autostart_for_targets(work_dir, [target])
+    return target_cmd_utils.ping_target(work_dir, target)
+
+
+def _resolve_mounted_targets(work_dir: Path, autostart: bool) -> list[str]:
+    targets = _resolve_project_targets(work_dir)
+    if autostart and targets:
+        _maybe_autostart_for_targets(work_dir, targets)
+
+    mounted: list[str] = []
+    for target in targets:
+        healthy, _detail = _probe_target(work_dir, target, autostart=False)
+        if healthy:
+            mounted.append(target)
+    return mounted
+
+
+def _mounted_providers(targets: list[str]) -> list[str]:
+    return _dedupe_keep_order([provider_of(target) for target in targets])
+
+
+def main(argv: list[str] | None = None) -> int:
+    argsv = list(sys.argv if argv is None else argv)
+    parser = argparse.ArgumentParser(prog="ccb-mounted")
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument("--json", dest="format", action="store_const", const="json")
+    format_group.add_argument("--simple", dest="format", action="store_const", const="simple")
+    parser.set_defaults(format="json")
+    parser.add_argument("--autostart", action="store_true")
+    parser.add_argument("path", nargs="?")
+    args = parser.parse_args(argsv[1:])
+
+    work_dir = _normalize_work_dir_arg(args.path)
+    mounted = _resolve_mounted_targets(work_dir, autostart=bool(args.autostart))
+    payload = {
+        "cwd": str(work_dir),
+        "mounted": mounted,
+        "mounted_providers": _mounted_providers(mounted),
+    }
+
+    if args.format == "simple":
+        print(" ".join(mounted))
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1201,6 +1201,7 @@ class CodexCommunicator:
                     work_dir = Path(wd_hint) if isinstance(wd_hint, str) and wd_hint else Path.cwd()
                     maybe_auto_transfer(
                         provider="codex",
+                        target=str(data.get("target") or self.session_info.get("target") or "").strip() or None,
                         work_dir=work_dir,
                         session_path=old_path_obj,
                         session_id=old_id or None,

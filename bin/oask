@@ -46,6 +46,7 @@ def _daemon_request_with_retries(
     timeout: float,
     quiet: bool,
     output_path: Path | None,
+    target: str | None = None,
 ) -> Optional[tuple[str, int]]:
     """
     Best-effort daemon request with retries to avoid autostart races.
@@ -56,7 +57,16 @@ def _daemon_request_with_retries(
     state_file = state_file_from_env(OASK_CLIENT_SPEC.state_file_env)
 
     # Fast path
-    result = try_daemon_request(OASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
+    result = try_daemon_request(
+        OASK_CLIENT_SPEC,
+        work_dir,
+        message,
+        timeout,
+        quiet,
+        state_file,
+        output_path=output_path,
+        target=target,
+    )
     if result is not None:
         return result
 
@@ -77,7 +87,7 @@ def _daemon_request_with_retries(
         except Exception:
             pass
 
-    started = maybe_start_daemon(OASK_CLIENT_SPEC, work_dir)
+    started = maybe_start_daemon(OASK_CLIENT_SPEC, work_dir, target=target)
     if started:
         wait_for_daemon_ready(OASK_CLIENT_SPEC, _daemon_startup_wait_s(timeout), state_file)
 
@@ -85,7 +95,16 @@ def _daemon_request_with_retries(
     wait_s = _daemon_retry_wait_s(timeout)
     deadline = time.time() + min(3.0, max(0.2, float(timeout)))
     while time.time() < deadline:
-        result = try_daemon_request(OASK_CLIENT_SPEC, work_dir, message, timeout, quiet, state_file, output_path=output_path)
+        result = try_daemon_request(
+            OASK_CLIENT_SPEC,
+            work_dir,
+            message,
+            timeout,
+            quiet,
+            state_file,
+            output_path=output_path,
+            target=target,
+        )
         if result is not None:
             return result
         time.sleep(wait_s)
@@ -119,16 +138,17 @@ def _daemon_retry_wait_s(timeout: float) -> float:
 
 
 def _usage() -> None:
-    print("Usage: oask [--async] [--sync] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
+    print("Usage: oask [--async] [--sync] [--target TARGET] [--session-file FILE] [--timeout SECONDS] [--output FILE] <message>", file=sys.stderr)
 
 
-def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Optional[str], bool, bool]:
+def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Optional[str], bool, bool, Optional[str]]:
     output: Optional[Path] = None
     timeout: Optional[float] = None
     quiet = False
     async_mode = False
     sync_mode = False
     session_file: Optional[str] = None
+    target: Optional[str] = None
     parts: list[str] = []
 
     it = iter(argv[1:])
@@ -144,6 +164,12 @@ def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Opti
             continue
         if token == "--sync":
             sync_mode = True
+            continue
+        if token == "--target":
+            try:
+                target = next(it)
+            except StopIteration:
+                raise ValueError("--target requires a target id")
             continue
         if token == "--session-file":
             try:
@@ -175,14 +201,14 @@ def _parse_args(argv: list[str]) -> Tuple[Optional[Path], float, str, bool, Opti
             timeout = 3600.0
     if async_mode:
         timeout = 0.0
-    return output, timeout, message, quiet, session_file, async_mode, sync_mode
+    return output, timeout, message, quiet, session_file, async_mode, sync_mode, target
 
 
 def main(argv: list[str]) -> int:
     try:
         from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK, atomic_write_text
 
-        output_path, timeout, message, quiet, session_file, async_mode, sync_mode = _parse_args(argv)
+        output_path, timeout, message, quiet, session_file, async_mode, sync_mode, target = _parse_args(argv)
         if not message and not sys.stdin.isatty():
             message = read_stdin_text().strip()
         if not message:
@@ -194,25 +220,35 @@ def main(argv: list[str]) -> int:
         work_dir, _ = resolve_work_dir_with_registry(
             OASK_CLIENT_SPEC,
             provider="opencode",
+            target=target,
             cli_session_file=session_file,
             env_session_file=os.environ.get("CCB_SESSION_FILE"),
         )
 
         # Prefer daemon mode: daemon performs per-session serialization and should accept concurrent submissions.
-        daemon_result = _daemon_request_with_retries(work_dir, message, timeout, quiet, output_path)
+        daemon_result = _daemon_request_with_retries(work_dir, message, timeout, quiet, output_path, target=target)
         if daemon_result is not None:
             reply, exit_code = daemon_result
-            # Inject guardrail prompt for Claude (skip in sync mode for Codex)
+            if exit_code >= 2 and not reply.strip():
+                print(f"[WARN] Daemon returned exit_code={exit_code} with empty reply, trying tmux fallback", file=sys.stderr)
+            else:
+                if not sync_mode:
+                    print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
+                if output_path:
+                    atomic_write_text(output_path, reply + "\n")
+                    return exit_code
+                if not async_mode:
+                    sys.stdout.write(reply)
+                    if not reply.endswith("\n"):
+                        sys.stdout.write("\n")
+                return exit_code
+
+        # Fallback: send directly to OpenCode pane
+        from askd_client import try_pane_fallback
+        if try_pane_fallback(OASK_CLIENT_SPEC, work_dir, message, target=target):
             if not sync_mode:
                 print(ASYNC_GUARDRAIL, file=sys.stderr, flush=True)
-            if output_path:
-                atomic_write_text(output_path, reply + "\n")
-                return exit_code
-            if not async_mode:
-                sys.stdout.write(reply)
-                if not reply.endswith("\n"):
-                    sys.stdout.write("\n")
-            return exit_code
+            return 0
 
         if not env_bool(OASK_CLIENT_SPEC.enabled_env, True):
             print(f"[ERROR] {OASK_CLIENT_SPEC.enabled_env}=0: oask daemon mode disabled.", file=sys.stderr)

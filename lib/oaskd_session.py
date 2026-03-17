@@ -8,7 +8,9 @@ from typing import Optional, Tuple
 
 from ccb_config import apply_backend_env
 from project_id import compute_ccb_project_id
+from session_store import load_target_session, session_path_for_target
 from session_utils import find_project_session_file as _find_project_session_file, safe_write_session
+from target_id import instance_of, validate_target
 from terminal import get_backend_for_session
 
 apply_backend_env()
@@ -190,6 +192,7 @@ class OpenCodeProjectSession:
 
                     maybe_auto_transfer(
                         provider="opencode",
+                        target=str(self.data.get("target") or "").strip() or None,
                         work_dir=Path(self.work_dir),
                         session_id=old_id or None,
                         project_id=old_project or None,
@@ -210,26 +213,47 @@ class OpenCodeProjectSession:
             return
 
 
-def load_project_session(work_dir: Path) -> Optional[OpenCodeProjectSession]:
+def load_project_session(work_dir: Path, target: str | None = None) -> Optional[OpenCodeProjectSession]:
+    canonical_target = None
+    if target:
+        try:
+            canonical_target = validate_target(target)
+        except ValueError:
+            return None
+        data = load_target_session(work_dir, canonical_target)
+        if data:
+            data.setdefault("target", canonical_target)
+            return OpenCodeProjectSession(
+                session_file=session_path_for_target(work_dir, canonical_target),
+                data=data,
+            )
+        if instance_of(canonical_target) != "main":
+            return None
+
     session_file = find_project_session_file(work_dir)
     if not session_file:
         return None
     data = _read_json(session_file)
     if not data:
         return None
+    if canonical_target:
+        data.setdefault("target", canonical_target)
     return OpenCodeProjectSession(session_file=session_file, data=data)
 
 
-def compute_session_key(session: OpenCodeProjectSession) -> str:
-    """
-    Compute the daemon routing/serialization key for this provider.
-
-    Hard rule: include provider + ccb_project_id to isolate projects and providers.
-    """
+def compute_session_key(session: OpenCodeProjectSession, target: str | None = None) -> str:
+    """Compute the daemon routing/serialization key for this provider."""
     pid = str(session.data.get("ccb_project_id") or "").strip()
     if not pid:
         try:
             pid = compute_ccb_project_id(Path(session.work_dir))
         except Exception:
             pid = ""
-    return f"opencode:{pid}" if pid else "opencode:unknown"
+    instance = "main"
+    target_value = target or str(session.data.get("target") or "").strip()
+    if target_value:
+        try:
+            instance = instance_of(validate_target(target_value))
+        except ValueError:
+            instance = "main"
+    return f"opencode:{pid}:{instance}" if pid else "opencode:unknown"

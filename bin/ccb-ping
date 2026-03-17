@@ -3,15 +3,20 @@
 ccb-ping - Test connectivity with AI providers.
 
 Usage:
-    ccb-ping <provider> [--session-file FILE] [--autostart]
+    ccb-ping [target] [--provider PROVIDER] [--session-file FILE] [--autostart]
 
-Providers:
-    gemini, codex, opencode, droid, claude
+Scopes:
+    ccb-ping codex@2
+    ccb-ping --provider codex
+    ccb-ping
+    ccb-ping codex            # legacy bare-provider compatibility
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import argparse
+import os
+import sys
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
@@ -19,23 +24,32 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
+import target_command_utils as target_cmd_utils
+
 setup_windows_encoding()
 
 
-# Provider to communicator module and class mapping
 PROVIDER_COMMS = {
     "gemini": ("gemini_comm", "GeminiCommunicator"),
     "codex": ("codex_comm", "CodexCommunicator"),
     "opencode": ("opencode_comm", "OpenCodeCommunicator"),
     "droid": ("droid_comm", "DroidCommunicator"),
     "claude": ("claude_comm", "ClaudeCommunicator"),
+    "cursor": None,
 }
 
-def _usage():
-    print("Usage: ccb-ping <provider> [--session-file FILE] [--autostart]", file=sys.stderr)
+
+def _usage() -> None:
+    print("Usage: ccb-ping [target] [--provider PROVIDER] [--session-file FILE] [--autostart]", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Scopes:", file=sys.stderr)
+    print("  ccb-ping codex@2", file=sys.stderr)
+    print("  ccb-ping --provider codex", file=sys.stderr)
+    print("  ccb-ping", file=sys.stderr)
+    print("  ccb-ping codex            # legacy bare-provider compatibility", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, cursor", file=sys.stderr)
 
 
 def _resolve_work_dir(session_file: str | None) -> Path:
@@ -48,47 +62,72 @@ def _resolve_work_dir(session_file: str | None) -> Path:
         p = Path(os.path.expanduser(raw)).resolve()
     except Exception:
         p = Path(os.path.expanduser(raw)).absolute()
-    # Session files normally live in <project>/.ccb/.<provider>-session
     parent_name = p.parent.name
     if parent_name in (".ccb", ".ccb_config"):
         return p.parent.parent
     return p.parent
 
 
-def main():
-    if len(sys.argv) < 2:
-        _usage()
-        return 1
+def _resolve_scope_targets(work_dir: Path, target: str | None = None, provider: str | None = None) -> list[str]:
+    positional = [target] if target else []
+    targets, _scope = target_cmd_utils.resolve_scope_targets_for_command(work_dir, positional=positional, provider=provider)
+    return targets
 
-    provider = sys.argv[1].lower()
 
-    if provider in ("-h", "--help"):
-        _usage()
-        return 0
+def _ping_targets(targets: list[str], work_dir: Path, autostart: bool = False) -> tuple[list[tuple[str, bool, str]], list[tuple[str, str]]]:
+    results: list[tuple[str, bool, str]] = []
+    errors: list[tuple[str, str]] = []
+    for target in targets:
+        healthy, message = target_cmd_utils.ping_target(work_dir, target)
+        results.append((target, healthy, message))
+        if not healthy:
+            errors.append((target, message))
+    return results, errors
 
-    if provider not in PROVIDER_COMMS:
-        print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
+
+def _run_legacy_provider_ping(provider: str, session_file: str | None = None, autostart: bool = False) -> int:
+    provider_name = str(provider or "").strip().lower()
+    if provider_name not in PROVIDER_COMMS:
+        print(f"[ERROR] Unknown provider: {provider_name}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(PROVIDER_COMMS.keys())}", file=sys.stderr)
         return 1
 
-    # Parse remaining arguments
-    parser = argparse.ArgumentParser(prog=f"ccb-ping {provider}", add_help=False)
-    parser.add_argument("--session-file", dest="session_file", default=None)
-    parser.add_argument("--autostart", action="store_true", help="Start daemon if needed")
-    args, _ = parser.parse_known_args(sys.argv[2:])
+    if session_file:
+        os.environ["CCB_SESSION_FILE"] = str(session_file)
+    work_dir = _resolve_work_dir(session_file)
 
-    if args.session_file:
-        os.environ["CCB_SESSION_FILE"] = str(args.session_file)
-    work_dir = _resolve_work_dir(args.session_file)
+    if provider_name == "cursor":
+        try:
+            from uaskd_session import load_project_session
+            from terminal import get_backend_for_session
 
-    # Import and instantiate the communicator
-    module_name, class_name = PROVIDER_COMMS[provider]
+            session = load_project_session(work_dir)
+            if not session:
+                print("[FAIL] No active Cursor CLI session found.")
+                return 1
+            pane_id = session.pane_id
+            if not pane_id:
+                print("[FAIL] No pane_id in .cursor-session")
+                return 1
+            backend = get_backend_for_session(session.data)
+            if not backend:
+                print("[FAIL] Terminal backend not available")
+                return 1
+            if backend.is_alive(pane_id):
+                print(f"[OK] Cursor CLI pane {pane_id} is alive")
+                return 0
+            print(f"[FAIL] Cursor CLI pane {pane_id} is not alive")
+            return 1
+        except Exception as exc:
+            print(f"[ERROR] Cursor CLI connectivity test failed: {exc}", file=sys.stderr)
+            return 1
+
+    module_name, class_name = PROVIDER_COMMS[provider_name]
     try:
         module = __import__(module_name)
         comm_class = getattr(module, class_name)
 
-        # Pre-emptive autostart check if requested
-        if args.autostart:
+        if autostart:
             try:
                 from askd_client import maybe_start_daemon, wait_for_daemon_ready
                 from providers import (
@@ -107,24 +146,75 @@ def main():
                     "droid": DASK_CLIENT_SPEC,
                 }
 
-                spec = specs.get(provider)
+                spec = specs.get(provider_name)
                 if spec:
                     maybe_start_daemon(spec, work_dir)
-                    # Small wait for it to bind
                     wait_for_daemon_ready(spec, 0.5)
-            except Exception as e:
-                print(f"[WARN] Autostart pre-check failed: {e}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[WARN] Autostart pre-check failed: {exc}", file=sys.stderr)
 
         comm = comm_class()
         healthy, message = comm.ping(display=False)
         print(message)
         return 0 if healthy else 1
-    except ImportError as e:
-        print(f"[ERROR] Module import failed: {e}", file=sys.stderr)
+    except ImportError as exc:
+        print(f"[ERROR] Module import failed: {exc}", file=sys.stderr)
         return 1
-    except Exception as e:
-        print(f"[ERROR] {provider.capitalize()} connectivity test failed: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[ERROR] {provider_name.capitalize()} connectivity test failed: {exc}", file=sys.stderr)
         return 1
+
+
+def _print_target_ping_result(target: str, healthy: bool, detail: str) -> None:
+    message = str(detail or "").strip()
+    if message and target in message:
+        print(message)
+        return
+    prefix = "[OK]" if healthy else "[FAIL]"
+    suffix = f" {message}" if message else ""
+    print(f"{prefix} {target}{suffix}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argsv = list(sys.argv if argv is None else argv)
+    parser = argparse.ArgumentParser(prog="ccb-ping", add_help=False)
+    parser.add_argument("scope", nargs="?")
+    parser.add_argument("--provider", dest="provider", default=None)
+    parser.add_argument("--session-file", dest="session_file", default=None)
+    parser.add_argument("--autostart", action="store_true", help="Start daemon if needed")
+    parser.add_argument("-h", "--help", action="store_true")
+    args, _unknown = parser.parse_known_args(argsv[1:])
+
+    if args.help:
+        _usage()
+        return 0
+
+    scope = str(args.scope or "").strip().lower()
+    provider = str(args.provider or "").strip().lower() or None
+
+    if provider and provider not in PROVIDER_COMMS:
+        print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
+        print(f"[ERROR] Available: {', '.join(PROVIDER_COMMS.keys())}", file=sys.stderr)
+        return 1
+
+    if scope and "@" not in scope and not provider:
+        return _run_legacy_provider_ping(scope, session_file=args.session_file, autostart=args.autostart)
+
+    if scope and provider:
+        print("[ERROR] target and --provider cannot be used together", file=sys.stderr)
+        return 1
+
+    work_dir = _resolve_work_dir(args.session_file)
+    target = scope if "@" in scope else None
+    targets = _resolve_scope_targets(work_dir, target=target, provider=provider)
+    if not targets:
+        print("[FAIL] No active targets found.", file=sys.stderr)
+        return 1
+
+    results, errors = _ping_targets(targets, work_dir, autostart=args.autostart)
+    for target_name, healthy, detail in results:
+        _print_target_ping_result(target_name, healthy, detail)
+    return 0 if not errors else 1
 
 
 if __name__ == "__main__":

@@ -12,7 +12,9 @@ from ccb_config import apply_backend_env
 from claude_session_resolver import resolve_claude_session
 from env_utils import env_bool, env_int
 from project_id import compute_ccb_project_id, normalize_work_dir
-from session_utils import safe_write_session
+from session_store import load_target_session, session_path_for_target
+from session_utils import find_project_session_file, safe_write_session
+from target_id import instance_of, validate_target
 from terminal import get_backend_for_session
 
 apply_backend_env()
@@ -237,7 +239,45 @@ class ClaudeProjectSession:
             return
 
 
-def load_project_session(work_dir: Path) -> Optional[ClaudeProjectSession]:
+def load_project_session(work_dir: Path, target: str | None = None) -> Optional[ClaudeProjectSession]:
+    canonical_target = None
+    if target:
+        try:
+            canonical_target = validate_target(target)
+        except ValueError:
+            return None
+        data = load_target_session(work_dir, canonical_target)
+        if data:
+            data.setdefault("target", canonical_target)
+            session_file = session_path_for_target(work_dir, canonical_target)
+            data.setdefault("work_dir", str(work_dir))
+            if not data.get("ccb_project_id"):
+                try:
+                    data["ccb_project_id"] = compute_ccb_project_id(Path(data.get("work_dir") or work_dir))
+                except Exception:
+                    pass
+            _ensure_work_dir_fields(data, session_file=session_file, fallback_work_dir=work_dir)
+            return ClaudeProjectSession(session_file=session_file, data=data)
+        if instance_of(canonical_target) != "main":
+            return None
+        legacy_session_file = find_project_session_file(work_dir, ".claude-session")
+        if legacy_session_file:
+            try:
+                with legacy_session_file.open("r", encoding="utf-8-sig", errors="replace") as handle:
+                    data = json.load(handle)
+            except Exception:
+                data = {}
+            if isinstance(data, dict) and data:
+                data.setdefault("target", canonical_target)
+                data.setdefault("work_dir", str(work_dir))
+                if not data.get("ccb_project_id"):
+                    try:
+                        data["ccb_project_id"] = compute_ccb_project_id(Path(data.get("work_dir") or work_dir))
+                    except Exception:
+                        pass
+                _ensure_work_dir_fields(data, session_file=legacy_session_file, fallback_work_dir=work_dir)
+                return ClaudeProjectSession(session_file=legacy_session_file, data=data)
+
     resolution = resolve_claude_session(work_dir)
     if not resolution:
         return None
@@ -250,6 +290,8 @@ def load_project_session(work_dir: Path) -> Optional[ClaudeProjectSession]:
             data["ccb_project_id"] = compute_ccb_project_id(Path(data.get("work_dir") or work_dir))
         except Exception:
             pass
+    if canonical_target:
+        data.setdefault("target", canonical_target)
     session_file = resolution.session_file
     if not session_file:
         try:
@@ -264,11 +306,18 @@ def load_project_session(work_dir: Path) -> Optional[ClaudeProjectSession]:
     return ClaudeProjectSession(session_file=session_file, data=data)
 
 
-def compute_session_key(session: ClaudeProjectSession) -> str:
+def compute_session_key(session: ClaudeProjectSession, target: str | None = None) -> str:
     pid = str(session.data.get("ccb_project_id") or "").strip()
     if not pid:
         try:
             pid = compute_ccb_project_id(Path(session.work_dir))
         except Exception:
             pid = ""
-    return f"claude:{pid}" if pid else "claude:unknown"
+    instance = "main"
+    target_value = target or str(session.data.get("target") or "").strip()
+    if target_value:
+        try:
+            instance = instance_of(validate_target(target_value))
+        except ValueError:
+            instance = "main"
+    return f"claude:{pid}:{instance}" if pid else "claude:unknown"

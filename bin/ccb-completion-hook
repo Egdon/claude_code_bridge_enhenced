@@ -33,6 +33,8 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import read_stdin_text, setup_windows_encoding
+from session_store import load_target_session
+from target_id import instance_of, provider_of, validate_target
 
 setup_windows_encoding()
 
@@ -295,6 +297,90 @@ def send_email_reply(provider: str, reply_content: str) -> bool:
         return False
 
 
+def _resolve_caller_target(caller: str) -> str:
+    caller_target = os.environ.get("CCB_CALLER_TARGET", "").strip().lower()
+    if caller_target:
+        try:
+            return validate_target(caller_target)
+        except ValueError:
+            return caller_target
+    caller_value = (caller or "").strip().lower()
+    if "@" in caller_value:
+        try:
+            return validate_target(caller_value)
+        except ValueError:
+            return caller_value
+    return ""
+
+
+def _resolve_caller_provider(caller: str, caller_target: str) -> str:
+    if caller_target:
+        try:
+            return provider_of(caller_target)
+        except ValueError:
+            pass
+    return (caller or "").strip().lower()
+
+
+def _session_matches_target(session_data: dict, caller_target: str) -> bool:
+    if not caller_target:
+        return True
+    try:
+        canonical_target = validate_target(caller_target)
+    except ValueError:
+        return False
+
+    raw_target = str(session_data.get("target") or "").strip().lower()
+    if raw_target:
+        try:
+            return validate_target(raw_target) == canonical_target
+        except ValueError:
+            return raw_target == canonical_target
+
+    try:
+        return instance_of(canonical_target) == "main"
+    except ValueError:
+        return False
+
+
+def _load_caller_target_session(work_dir: str, caller_target: str) -> dict:
+    if not work_dir or not caller_target:
+        return {}
+    try:
+        data = load_target_session(Path(work_dir), caller_target)
+    except Exception:
+        data = None
+    return dict(data or {}) if isinstance(data, dict) else {}
+
+
+def _run_ask_fallback(ask_cmd: str, caller_provider: str, caller_target: str, message: str, timeout: float) -> int:
+    try:
+        env = os.environ.copy()
+        if caller_provider:
+            env["CCB_CALLER"] = caller_provider
+        if caller_target:
+            env["CCB_CALLER_TARGET"] = caller_target
+        if os.name == "nt":
+            result = subprocess.run(
+                [sys.executable, ask_cmd, caller_provider, "--notify", "--no-wrap", message],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        else:
+            result = subprocess.run(
+                [ask_cmd, caller_provider, "--notify", "--no-wrap", message],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        return result.returncode
+    except Exception:
+        return 0
+
+
 def main() -> int:
     if not env_bool("CCB_COMPLETION_HOOK_ENABLED", True):
         return 0
@@ -309,11 +395,14 @@ def main() -> int:
 
     provider = args.provider.lower()
     output_file = args.output or None
+    provider_target = os.environ.get("CCB_TARGET", "").strip().lower()
 
     # Check CCB_CALLER env var first, then fall back to --caller arg
     caller = os.environ.get("CCB_CALLER", "").strip().lower()
     if not caller:
         caller = args.caller.lower()
+    caller_target = _resolve_caller_target(caller)
+    caller_provider = _resolve_caller_provider(caller, caller_target)
 
     # Read reply from stdin using cross-platform helper
     reply_content = ""
@@ -328,14 +417,30 @@ def main() -> int:
             return 0
         return 1
 
+    # Cursor IDE pulls results explicitly via pend/cpend/opend/upend.
+    # Skip tmux notifications to avoid polluting Cursor CLI context.
+    if caller in ("cursor-ide", "anchor"):
+        return 0
+
+    # Per-caller opt-out: CCB_SKIP_NOTIFY=1 suppresses completion notifications.
+    if env_bool("CCB_SKIP_NOTIFY", False):
+        return 0
+
     # Terminal caller - construct notification message
     provider_names = {
         "codex": "Codex",
         "gemini": "Gemini",
         "opencode": "OpenCode",
         "droid": "Droid",
+        "cursor": "Cursor",
     }
     provider_display = provider_names.get(provider, provider.capitalize())
+    if provider_target:
+        try:
+            target_provider, target_instance = validate_target(provider_target).split("@", 1)
+            provider_display = f"{provider_names.get(target_provider, target_provider.capitalize())}@{target_instance}"
+        except ValueError:
+            provider_display = provider_target
     req_id = args.req_id or "unknown"
 
     if output_file:
@@ -356,91 +461,68 @@ Provider: {provider_display}
 Result: {reply_content}
 """
 
-    # Find caller's pane_id from session file
+    # Find caller's pane_id from target session first, then fall back to legacy session file lookup.
     session_files = {
         "claude": ".claude-session",
         "codex": ".codex-session",
         "droid": ".droid-session",
+        "cursor": ".cursor-session",
+        "opencode": ".opencode-session",
     }
-    session_filename = session_files.get(caller, ".claude-session")
-
-    # Search for session file in multiple locations (order matters - most specific first)
     work_dir = os.environ.get("CCB_WORK_DIR", "")
-    search_paths = []
-    config_dirnames = (".ccb", ".ccb_config")
-
-    # 1. Request's work_dir (most specific)
-    if work_dir:
-        for dirname in config_dirnames:
-            search_paths.append(Path(work_dir) / dirname / session_filename)
-
-    # 2. Current working directory (fallback)
-    cwd = os.getcwd()
-    if cwd != work_dir:
-        for dirname in config_dirnames:
-            search_paths.append(Path(cwd) / dirname / session_filename)
-
-    # 3. User's home-based locations
-    for dirname in config_dirnames:
-        search_paths.append(Path.home() / ".local" / "share" / "codex-dual" / dirname / session_filename)
-
-    # 4. On Windows, also check LOCALAPPDATA
-    if os.name == "nt":
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        if localappdata:
-            for dirname in reversed(config_dirnames):
-                search_paths.insert(0, Path(localappdata) / "codex-dual" / dirname / session_filename)
-
     pane_id = None
     terminal = "tmux"  # default
     session_data = {}
-    found_session_path = None
 
-    for session_path in search_paths:
-        if session_path.exists():
-            session_data = load_session_file(session_path)
-            pane_id = session_data.get("pane_id")
-            terminal = session_data.get("terminal", "tmux")
-            if pane_id:
-                found_session_path = session_path
-                # Validate: check if session's work_dir matches request's work_dir
-                session_work_dir = session_data.get("work_dir", "")
-                if work_dir and session_work_dir and session_work_dir != work_dir:
-                    # Session file is for a different project, skip it
-                    pane_id = None
-                    continue
-                break
+    if caller_target:
+        session_data = _load_caller_target_session(work_dir, caller_target)
+        pane_id = session_data.get("pane_id") or session_data.get("tmux_session")
+        terminal = session_data.get("terminal", "tmux")
 
     if not pane_id:
-        # No pane_id found, try ask command
+        session_filename = session_files.get(caller_provider, ".claude-session")
+        search_paths = []
+        config_dirnames = (".ccb", ".ccb_config")
+
+        if work_dir:
+            for dirname in config_dirnames:
+                search_paths.append(Path(work_dir) / dirname / session_filename)
+
+        cwd = os.getcwd()
+        if cwd != work_dir:
+            for dirname in config_dirnames:
+                search_paths.append(Path(cwd) / dirname / session_filename)
+
+        for dirname in config_dirnames:
+            search_paths.append(Path.home() / ".local" / "share" / "codex-dual" / dirname / session_filename)
+
+        if os.name == "nt":
+            localappdata = os.environ.get("LOCALAPPDATA", "")
+            if localappdata:
+                for dirname in reversed(config_dirnames):
+                    search_paths.insert(0, Path(localappdata) / "codex-dual" / dirname / session_filename)
+
+        for session_path in search_paths:
+            if session_path.exists():
+                session_data = load_session_file(session_path)
+                pane_id = session_data.get("pane_id")
+                terminal = session_data.get("terminal", "tmux")
+                if pane_id:
+                    session_work_dir = session_data.get("work_dir", "")
+                    if work_dir and session_work_dir and session_work_dir != work_dir:
+                        pane_id = None
+                        continue
+                    if caller_target and not _session_matches_target(session_data, caller_target):
+                        pane_id = None
+                        continue
+                    break
+
+    if not pane_id:
         timeout = env_float("CCB_COMPLETION_HOOK_TIMEOUT", 10.0)
         ask_cmd = find_ask_command()
         if not ask_cmd:
             return 0
-        try:
-            env = os.environ.copy()
-            if caller:
-                env["CCB_CALLER"] = caller
-            # Use sys.executable to run ask command on Windows
-            if os.name == "nt":
-                result = subprocess.run(
-                    [sys.executable, ask_cmd, caller, "--notify", "--no-wrap", message],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=env,
-                )
-            else:
-                result = subprocess.run(
-                    [ask_cmd, caller, "--notify", "--no-wrap", message],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=env,
-                )
-            return result.returncode
-        except Exception:
-            return 0
+        return _run_ask_fallback(ask_cmd, caller_provider, caller_target, message, timeout)
 
     # Send directly via terminal backend
     if send_via_terminal(pane_id, message, terminal, session_data):
@@ -451,28 +533,7 @@ Result: {reply_content}
     ask_cmd = find_ask_command()
     if not ask_cmd:
         return 0
-    try:
-        env = os.environ.copy()
-        if caller:
-            env["CCB_CALLER"] = caller
-        if os.name == "nt":
-            subprocess.run(
-                [sys.executable, ask_cmd, caller, "--notify", "--no-wrap", message],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-        else:
-            subprocess.run(
-                [ask_cmd, caller, "--notify", "--no-wrap", message],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-    except Exception:
-        pass
+    _run_ask_fallback(ask_cmd, caller_provider, caller_target, message, timeout)
     return 0
 
 

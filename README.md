@@ -395,19 +395,29 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 install
 
 ### Run
 ```bash
-ccb                    # Start providers from ccb.config (default: all four)
-ccb codex gemini       # Start both
-ccb codex gemini opencode claude  # Start all four (spaces)
-ccb codex,gemini,opencode,claude  # Start all four (commas)
-ccb -r codex gemini     # Resume last session for Codex + Gemini
-ccb -a codex gemini opencode  # Auto-approval mode with multiple providers
-ccb -a -r codex gemini opencode claude  # Auto + resume for all providers
+ccb                                # Start targets from ccb.config
+ccb codex@main claude@main         # Start two targets
+ccb codex@1 codex@2 claude@main    # Start two Codex instances + Claude anchor
+ccb codex@1,codex@2,claude@main    # Same, with commas
+ccb -r codex@1 claude@main         # Resume target sessions
+ccb -a codex@1 codex@2 claude@main # Auto-approval mode with multiple targets
+ccb -a -r codex@1 codex@2 claude@main
 
-tmux tip: CCB's tmux status/pane theming is enabled only while CCB is running.
-
-Layout rule: the last provider runs in the current pane. Extras are ordered as `[cmd?, reversed providers]`; the first extra goes to the top-right, then the left column fills top-to-bottom, then the right column fills top-to-bottom. Examples: 4 panes = left2/right2, 5 panes = left2/right3.
-Note: `ccb up` is removed; use `ccb ...` or configure `ccb.config`.
+# Running session changes (same project)
+ccb add codex@3                    # Add a new target at runtime
+ccb rm codex@2                     # Remove one running target
 ```
+
+- Target syntax is `provider@instance`. For startup, always pass the explicit `@instance` form such as `claude@main`.
+- The **last target is the anchor** and runs in the **current pane**. Example: in `ccb codex@1 codex@2 claude@main`, `claude@main` is the anchor.
+- Non-anchor targets may be spawned in a different internal order to keep the pane layout stable, but the anchor rule always follows the input order.
+- `ccb add` / `ccb rm` prefer the **live control plane** of the current running session. If the live socket is unreachable, CCB falls back to the persisted target session / registry state.
+- Full guide (Chinese): [`TARGET_USAGE_GUIDE.zh.md`](TARGET_USAGE_GUIDE.zh.md)
+
+`tmux` tip: CCB's tmux status/pane theming is enabled only while CCB is running.
+
+Layout rule: the last target runs in the current pane. Extras are ordered as `[cmd?, reversed targets[:-1]]`; the first extra goes to the top-right, then the left column fills top-to-bottom, then the right column fills top-to-bottom. Examples: 4 panes = left2/right2, 5 panes = left2/right3.
+Note: `ccb up` is removed; use `ccb ...` or configure `ccb.config`.
 
 ### Flags
 | Flag | Description | Example |
@@ -424,22 +434,24 @@ Default lookup order:
 
 Simple format (recommended):
 ```text
-codex,gemini,opencode,claude
+codex@1,codex@2,claude@main
 ```
 
 Enable cmd pane (default title/command):
 ```text
-codex,gemini,opencode,claude,cmd
+codex@1,codex@2,claude@main,cmd
 ```
 
 Advanced JSON (optional, for flags or custom cmd pane):
 ```json
 {
-  "providers": ["codex", "gemini", "opencode", "claude"],
+  "targets": ["codex@1", "codex@2", "claude@main"],
   "cmd": { "enabled": true, "title": "CCB-Cmd", "start_cmd": "bash" },
   "flags": { "auto": false, "resume": false }
 }
 ```
+
+Legacy provider-only config is still read during the migration window and normalized as `@main` (for example `codex,opencode,cursor` → `codex@main,opencode@main,cursor@main`).
 Cmd pane participates in the layout as the first extra pane and does not change which AI runs in the current pane.
 
 ### Update
@@ -574,25 +586,50 @@ Once started, collaborate naturally. Claude will detect when to delegate tasks.
 ## 🛠️ Unified Command System
 
 ### Legacy Commands (Deprecated)
-- `cask/gask/oask/dask/lask` - Independent ask commands per provider
-- `cping/gping/oping/dping/lping` - Independent ping commands  
-- `cpend/gpend/opend/dpend/lpend` - Independent pend commands
+- `cask/gask/oask/dask/lask/uask` - Independent ask commands per provider
+- `cping/gping/oping/dping/lping/uping` - Independent ping commands  
+- `cpend/gpend/opend/dpend/lpend/upend` - Independent pend commands
 
 ### Unified Commands
-- **`ask <provider> <message>`** - Unified request (background by default)
-  - Supports: `gemini`, `codex`, `opencode`, `droid`, `claude`
-  - Defaults to background; managed Codex sessions prefer foreground to avoid cleanup
-  - Override with `--foreground` / `--background` or `CCB_ASK_FOREGROUND=1` / `CCB_ASK_BACKGROUND=1`
-  - Foreground uses sync send and disables completion hook unless `CCB_COMPLETION_HOOK_ENABLED` is set
-  - Supports `--notify` for short synchronous notifications
-  - Supports `CCB_CALLER` (default: `codex` in Codex sessions, otherwise `claude`)
+- **`ask <provider|provider@instance> <message>`** - Unified request (background by default)
+  - Supports: `gemini`, `codex`, `opencode`, `droid`, `claude`, `cursor`
+  - In multi-instance mode, prefer an explicit target such as `ask codex@2 "..."`
+  - Override background/foreground with `--foreground` / `--background` or `CCB_ASK_FOREGROUND=1` / `CCB_ASK_BACKGROUND=1`
+  - Foreground disables the completion hook unless `CCB_COMPLETION_HOOK_ENABLED` is set
+  - Supports `--notify` for short synchronous notifications; today this may fall back to the legacy provider daemon path
+  - When calling from an external shell, set `CCB_CALLER` explicitly, e.g. `CCB_CALLER=claude ask codex@2 --foreground "..."`
+  - In multi-instance mode, avoid relying on bare `ask codex ...` because environment-based target inference may kick in
 
-- **`ccb-ping <provider>`** - Unified connectivity test
-  - Checks if the specified provider's daemon is online
+- **`cask/gask/oask/dask/lask/uask --target <provider@instance> <message>`** - Provider-specific ask entry points
+  - Example: `cask --target codex@2 "..."`
+  - Example: `lask --target claude@main "..."`
+  - Example: `uask --target cursor@exp "..."`
+
+- **`ccb-ping [target]` / `ccb-ping --provider <provider>` / `ccb-ping`** - Unified connectivity test
+  - Target scope: `ccb-ping codex@1`
+  - Provider scope: `ccb-ping --provider codex`
+  - All scope: `ccb-ping`
+
+- **`ccb kill [target]` / `ccb kill --provider <provider>` / `ccb kill`** - Unified stop / cleanup
+  - Target scope: `ccb kill codex@2`
+  - Provider scope: `ccb kill --provider codex`
+  - All scope: `ccb kill`
+
+- **`autonew [target|provider]` / `autonew`** - Reset running sessions without touching unrelated targets
+  - Target scope: `autonew codex@1`
+  - Provider scope: `autonew codex`
+  - All scope: `autonew`
 
 - **`pend <provider> [N]`** - Unified reply fetch
-  - Fetches latest N replies from the provider
-  - Optional N specifies number of recent messages
+  - This is currently a provider-level view, not a target-level selector
+  - Example: `pend codex 5`
+  - Do not expect `pend codex@2` to work as a dedicated target view
+
+- **`ccb-mounted [--json|--simple] [--autostart] [path]`** - Show which targets are actually mounted and healthy
+  - `--json` prints `mounted` and `mounted_providers`
+  - `--simple` prints a space-separated target list
+  - `--autostart` tries to bring offline provider daemons up before probing
+  - See the full Chinese target guide: [`TARGET_USAGE_GUIDE.zh.md`](TARGET_USAGE_GUIDE.zh.md)
 
 ### Skills System
 - `/ask <provider> <message>` - Request skill (background by default; foreground in managed Codex sessions)

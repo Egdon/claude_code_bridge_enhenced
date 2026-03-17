@@ -8,7 +8,9 @@ from typing import Optional, Tuple
 
 from ccb_config import apply_backend_env
 from project_id import compute_ccb_project_id
+from session_store import load_target_session, session_path_for_target
 from session_utils import find_project_session_file as _find_project_session_file, safe_write_session
+from target_id import instance_of, validate_target
 from terminal import get_backend_for_session
 
 apply_backend_env()
@@ -189,6 +191,7 @@ class DroidProjectSession:
                             old_path_obj = None
                     maybe_auto_transfer(
                         provider="droid",
+                        target=str(self.data.get("target") or "").strip() or None,
                         work_dir=Path(self.work_dir),
                         session_path=old_path_obj,
                         session_id=old_id or None,
@@ -206,7 +209,25 @@ class DroidProjectSession:
         safe_write_session(self.session_file, payload)
 
 
-def load_project_session(work_dir: Path) -> Optional[DroidProjectSession]:
+def load_project_session(work_dir: Path, target: str | None = None) -> Optional[DroidProjectSession]:
+    canonical_target = None
+    if target:
+        try:
+            canonical_target = validate_target(target)
+        except ValueError:
+            return None
+        data = load_target_session(work_dir, canonical_target)
+        if data:
+            if data.get("active") is False:
+                return None
+            data.setdefault("target", canonical_target)
+            return DroidProjectSession(
+                session_file=session_path_for_target(work_dir, canonical_target),
+                data=data,
+            )
+        if instance_of(canonical_target) != "main":
+            return None
+
     session_file = find_project_session_file(work_dir)
     if not session_file:
         return None
@@ -215,14 +236,23 @@ def load_project_session(work_dir: Path) -> Optional[DroidProjectSession]:
         return None
     if data.get("active") is False:
         return None
+    if canonical_target:
+        data.setdefault("target", canonical_target)
     return DroidProjectSession(session_file=session_file, data=data)
 
 
-def compute_session_key(session: DroidProjectSession) -> str:
+def compute_session_key(session: DroidProjectSession, target: str | None = None) -> str:
     pid = str(session.data.get("ccb_project_id") or "").strip()
     if not pid:
         try:
             pid = compute_ccb_project_id(Path(session.work_dir))
         except Exception:
             pid = ""
-    return f"droid:{pid}" if pid else "droid:unknown"
+    instance = "main"
+    target_value = target or str(session.data.get("target") or "").strip()
+    if target_value:
+        try:
+            instance = instance_of(validate_target(target_value))
+        except ValueError:
+            instance = "main"
+    return f"droid:{pid}:{instance}" if pid else "droid:unknown"

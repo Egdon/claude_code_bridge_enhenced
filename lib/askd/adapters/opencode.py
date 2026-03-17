@@ -15,10 +15,9 @@ from askd_runtime import log_path, write_log
 from completion_hook import notify_completion
 from env_utils import env_bool
 from oaskd_protocol import is_done_text, strip_done_text, wrap_opencode_prompt
-from oaskd_session import load_project_session
+from oaskd_session import compute_session_key, load_project_session
 from opencode_comm import OpenCodeLogReader
 from process_lock import ProviderLock
-from project_id import compute_ccb_project_id
 from providers import OASKD_SPEC
 from terminal import get_backend_for_session
 
@@ -50,20 +49,13 @@ class OpenCodeAdapter(BaseProviderAdapter):
     def session_filename(self) -> str:
         return ".opencode-session"
 
-    def load_session(self, work_dir: Path) -> Optional[Any]:
-        return load_project_session(work_dir)
+    def load_session(self, work_dir: Path, target: str | None = None) -> Optional[Any]:
+        return load_project_session(work_dir, target)
 
-    def compute_session_key(self, session: Any) -> str:
+    def compute_session_key(self, session: Any, target: str | None = None) -> str:
         if not session:
             return "opencode:unknown"
-        ccb_project_id = ""
-        try:
-            ccb_project_id = str(session.data.get("ccb_project_id") or "").strip()
-            if not ccb_project_id:
-                ccb_project_id = compute_ccb_project_id(Path(session.work_dir))
-        except Exception:
-            pass
-        return f"opencode:{ccb_project_id}" if ccb_project_id else "opencode:unknown"
+        return compute_session_key(session, target)
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
@@ -71,8 +63,8 @@ class OpenCodeAdapter(BaseProviderAdapter):
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=opencode req_id={task.req_id} work_dir={req.work_dir}")
 
-        session = load_project_session(work_dir)
-        session_key = self.compute_session_key(session)
+        session = load_project_session(work_dir, req.target)
+        session_key = self.compute_session_key(session, req.target)
 
         if not session:
             return ProviderResult(
@@ -231,6 +223,8 @@ class OpenCodeAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 done_seen=done_seen,
                 caller=req.caller,
+                target=req.target,
+                caller_target=req.caller_target,
                 email_req_id=req.email_req_id,
                 email_msg_id=req.email_msg_id,
                 email_from=req.email_from,
